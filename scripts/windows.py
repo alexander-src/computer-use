@@ -589,7 +589,20 @@ class WindowManager:
             raise ValueError("Empty launch command")
         # Reap any previously finished child processes so we never leak zombies
         self._spawned = [p for p in self._spawned if p.poll() is None]
-        before_ids = {w["id"] for w in self.state()["windows"]}
+        q = (wait_app or os.path.splitext(os.path.basename(argv[0]))[0]).lower()
+        st0 = self.state()
+        # If a single-app launch target is already open, focus it in ~1.5 ms instead of spawning a slow wrapper
+        if len(argv) == 1 and q:
+            existing = next((w for w in st0["windows"] if q in (w["app"] + " " + w["title"]).lower()), None)
+            if existing is not None:
+                try:
+                    self.control("focus", window_id=existing["id"])
+                    time.sleep(0.03)
+                except Exception:
+                    pass
+                return {"pid": existing.get("pid", 0), "command": argv, "window": existing, "focused_existing": True}
+
+        before_ids = {w["id"] for w in st0["windows"]}
         proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
@@ -601,14 +614,25 @@ class WindowManager:
         appeared = None
         if wait_app is not None or timeout_ms > 0:
             deadline = time.monotonic() + max(0.2, timeout_ms / 1000.0)
-            q = (wait_app or os.path.basename(argv[0])).lower()
             while time.monotonic() < deadline:
-                time.sleep(0.06)
-                for w in self.state()["windows"]:
-                    if w["id"] not in before_ids:
-                        if not wait_app or q in (w["app"] + " " + w["title"]).lower():
+                time.sleep(0.05)
+                wins = self.state()["windows"]
+                # Prefer a newly created window matching q, or an existing window matching q that became active
+                for w in wins:
+                    hay = (w["app"] + " " + w["title"]).lower()
+                    if w["id"] not in before_ids and (not q or q in hay):
+                        appeared = w
+                        break
+                if appeared is None and q:
+                    for w in wins:
+                        if w.get("active") and q in (w["app"] + " " + w["title"]).lower():
                             appeared = w
                             break
                 if appeared:
+                    if not appeared.get("active"):
+                        try:
+                            self.control("focus", window_id=appeared["id"])
+                        except Exception:
+                            pass
                     break
         return {"pid": proc.pid, "command": argv, "window": appeared}

@@ -661,7 +661,7 @@ class TestEngineAndProtocol(unittest.TestCase):
         self.assertIn('[159,49] "Save Changes"', compact)
         self.assertIn('[628,49] "Cancel"', compact)
 
-    def test_superhuman_compound_ops_ocr_and_zero_waste(self):
+    def test_compound_ops_inline_ocr_and_hot_reload(self):
         ocr_words = [
             {"text": "Search", "x": 400, "y": 100, "w": 60, "h": 20, "conf": 94.0},
             {"text": "Accept", "x": 500, "y": 240, "w": 60, "h": 20, "conf": 95.0},
@@ -697,6 +697,31 @@ class TestEngineAndProtocol(unittest.TestCase):
         self.assertEqual(len(obs), 1)
         self.assertIn("OCR_TEXT", obs[0]["text"])
         self.assertIn('[430,110] "Search"', obs[0]["text"])
+
+        # In hybrid mode on sparse-AX apps, >=5 OCR words returns inline OCR_TEXT with ZERO image offload!
+        rich_ocr = FakeOCR(responses=[[
+            {"text": "Create", "x": 100, "y": 100, "w": 50, "h": 18, "conf": 95.0},
+            {"text": "My", "x": 158, "y": 100, "w": 22, "h": 18, "conf": 95.0},
+            {"text": "Own", "x": 186, "y": 100, "w": 32, "h": 18, "conf": 95.0},
+            {"text": "Server", "x": 224, "y": 100, "w": 48, "h": 18, "conf": 95.0},
+            {"text": "Cancel", "x": 100, "y": 200, "w": 52, "h": 18, "conf": 95.0},
+        ]])
+        eng2, *_ = self._make_engine(elements=[], ocr=rich_ocr)
+        obs_h = eng2.tool_observe({"mode": "hybrid"})
+        self.assertEqual(len(obs_h), 1)
+        self.assertIn("OCR_INLINE", obs_h[0]["text"])
+        self.assertIn("Create My Own Server", obs_h[0]["text"])
+        act_a = eng2.tool_act({"steps": [{"op": "wait", "ms": 0}], "observe": "auto"})
+        self.assertEqual(len(act_a), 1)
+        self.assertIn("OCR_INLINE", act_a[0]["text"])
+        # Explicit screenshot=True still attaches the JPEG image!
+        obs_v = eng2.tool_observe({"mode": "hybrid", "screenshot": True})
+        self.assertEqual(len(obs_v), 2)
+        self.assertEqual(obs_v[1]["type"], "image")
+
+        # Verify script mtime tracker works cleanly for in-process hot-reload
+        mtimes = mcp.MCPServer._script_mtimes()
+        self.assertIn("computer_use_mcp.py", mtimes)
 
     def test_cursor_overlay_glide_to_is_non_blocking(self):
         # Even with a long 250ms glide animation, glide_to() must return in <10ms (async on overlay thread)

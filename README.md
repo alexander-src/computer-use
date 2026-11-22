@@ -1,6 +1,6 @@
 # computer-use
 
-Superhuman-speed native desktop automation MCP server and Antigravity plugin for Linux (Wayland and X11), Windows 10/11, and macOS (Apple Silicon and Intel): 4.5 ms full-screen capture + JPEG, 0.008 ms non-blocking 120Hz cyan AI cursor with click ripples, independent user mouse, 8-thread parallel local OCR, closed-loop compound ops, background mode, and semantic AT-SPI2 / Windows UIA / macOS `AXUIElement` `[ref]` trees.
+Fast native desktop automation MCP server and Antigravity plugin for Linux (Wayland and X11), Windows 10/11, and macOS (Apple Silicon and Intel): 4.5 ms full-screen capture + JPEG, non-blocking 120Hz cyan AI cursor with click ripples, independent user mouse, 8-thread parallel local OCR with inline `[x,y]` labels, closed-loop compound ops, background mode, and semantic AT-SPI2 / Windows UIA / macOS `AXUIElement` `[ref]` trees.
 
 Works with Antigravity, Claude Code, Codex CLI, Cursor, Gemini CLI, and any stdio MCP client.
 
@@ -30,43 +30,36 @@ cd computer-use
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Both installers set up the Antigravity plugin bundle (`~/.gemini/config/plugins/computer-use/`) and run `--selftest`. Restart Antigravity (or refresh MCP Servers) afterward so it loads the updated MCP server. See [INSTALL.md](INSTALL.md) for macOS permission setup and Claude Code, Codex CLI, Cursor, and Gemini CLI one-liners.
+Both installers set up the Antigravity plugin bundle (`~/.gemini/config/plugins/computer-use/`) and run `--selftest`. Restart Antigravity once after initial install so it launches the new MCP server (from v2.3.0 onward, the server also hot-reloads `scripts/*.py` in-process whenever updated on disk). See [INSTALL.md](INSTALL.md) for macOS permission setup and Claude Code, Codex CLI, Cursor, and Gemini CLI one-liners.
 
-## Why It Is Faster Than a Human (Measured Latency)
+## Reducing Both Local Overhead and LLM Round-Trips
 
-The real bottleneck in desktop agents is both local overhead and cloud LLM round-trip count. `computer-use` v2.2 eliminates both: local actions run in sub-millisecond to single-digit-millisecond time, and compound ops plus 8-thread local OCR collapse 4 to 6 LLM turns into one sub-second call.
+End-to-end speed in a desktop agent depends mostly on how many cloud LLM turns a task takes, not just raw millisecond timings. `computer-use` v2.3 cuts both:
 
-Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python3 scripts/computer_use_mcp.py --bench` and end-to-end tool profiling:
+- Inline local OCR replaces double-turn image offloads: on apps with empty accessibility trees (Discord, Brave, Chrome, Electron, VS Code, Spotify), `desktop_observe()` and `desktop_act(observe="auto")` run 8-thread in-process `libtesseract` (~40 to 82 ms) and return clickable `[x,y] "Label"` coordinates inline in the text response. Hosts that offload MCP images to disk no longer force an extra `read_file` round-trip on every dialog step (pass `mode: "vision"` or `screenshot: true` only for textless icons).
+- Closed-loop compound ops collapse multi-dialog flows into one call: `launch` (focuses an already-open window in ~1.5 ms or waits for the matching window), `open_url`, `wait_and_click` (polls AX + local OCR every 45 ms), `click_and_type`, `keys`, `repeat`, and `wait(change=true)` eliminate blind 500 ms sleeps and per-click cloud turns.
+- Non-blocking cursor glide and zero-waste defaults: the cyan AI cursor animates at 120Hz on a background thread (`0.008 ms` on the action path), and `desktop_act(observe="none")` skips redundant window and frame queries.
+
+Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python3 scripts/computer_use_mcp.py --bench` and tool profiling:
 
 | Operation | Backend | Measured | Notes |
 | --- | --- | ---: | --- |
-| `desktop_act(observe="none")` burst overhead | Direct `/dev/uinput` + skip redundant queries | 0.05 ms | Zero capture, zero settle |
-| Smooth cyan AI cursor glide (`55 ms` curve) | Non-blocking 120Hz overlay thread (`glide_to`) | 0.008 ms | Animates off the action path |
-| `desktop_act(observe="auto")` full turn | `KWin.ScreenShot2` + `896px` `libturbojpeg` | 7.37 ms | 43 KB base64 payload |
-| `desktop_observe(mode="hybrid")` | KWin DBus + sparse AX cache + `896px` grid | 8.45 ms | 47 KB base64 payload |
+| `desktop_act(observe="none")` overhead | Direct `/dev/uinput` | 0.05 ms | Zero capture, zero settle |
+| Smooth cyan AI cursor glide (`55 ms` curve) | 120Hz async overlay thread (`glide_to`) | 0.008 ms | Animates off the action path |
+| `desktop_act(observe="auto")` (visual) | `KWin.ScreenShot2` + `896px` `libturbojpeg` | 7.37 ms | 43 KB base64 payload |
+| `desktop_observe(mode="hybrid")` (visual) | KWin DBus + sparse AX cache + `896px` grid | 8.45 ms | 47 KB base64 payload |
 | `400x300` region capture | `org.kde.KWin.ScreenShot2` FD pipe | 0.25 ms | Sub-millisecond crop |
 | Full `1920x1080` capture + `896px` JPEG (`q=62`) | `KWin.ScreenShot2` + Cairo + AVX2 `libturbojpeg` | 4.54 ms | 41 KB (50 KB with grid) |
-| Full-screen `1920x1080` local OCR scan | 8-thread in-process `ctypes` `libtesseract` | 82.0 ms | 0.00 ms on cached frame, 0 image tokens |
+| Full-screen `1920x1080` local OCR scan | 8-thread in-process `ctypes` `libtesseract` | 82.0 ms | 0.00 ms on cached frame, 0 image offload |
 | Window list + active window + cursor | `org.kde.KWin /Scripting` DBus | 1.23 ms | 1.15 ms min |
-| Clipboard read | `org.kde.klipper` DBus | 0.03 ms | Async clipboard restore saves ~110 ms/paste |
+| Clipboard read | `org.kde.klipper` DBus | 0.03 ms | Async restore saves ~110 ms/paste |
 | Private background capture (`800x600`) | Authenticated `Xvfb` + direct `libX11` | 1.91 ms | Zero interference with live session |
-
-### Local Closed-Loop Compound Ops (Zero Extra LLM Turns)
-
-Instead of taking a screenshot, asking a cloud model where a button is, clicking, waiting, and screenshotting again, chain these ops inside ONE `desktop_act` call:
-
-- `open_url`: focuses or launches a browser, opens a tab or address bar (`ctrl+l`/`cmd+l` or `ctrl+t`/`cmd+t`), pastes the URL, and presses Enter in one step.
-- `wait_and_click`: polls AX + 8-thread local OCR every 45 ms and clicks the millisecond a label appears (even inside Chromium, Electron, VS Code, Discord, or games), with optional `clear`, `type_text`, and `submit`.
-- `click_and_type`: locates a field by `ref`, `target` (AX or local OCR text), or coordinates, clicks it, clears if requested, types, and submits.
-- `keys`: fires a rapid sequence of hotkeys (`["ctrl+a", "ctrl+c", "alt+tab", "ctrl+v"]`) locally.
-- `repeat`: loops a sequence of steps up to 200 times locally with zero extra model turns.
-- `desktop_observe(mode="ocr")`: returns clickable `[x,y] "Label"` text lines directly with zero base64 image upload.
 
 ## Independent AI Cursor and Background Mode
 
 ### Non-Blocking 120Hz Custom AI Cursor (Keep Your Own Mouse)
 
-While the agent clicks a target, a click-through cyan AI pointer glides smoothly along an ease-in-out curve at 120Hz on the dedicated overlay thread (`0.008 ms` call overhead, zero blocking sleep on the MCP action path) and plays expanding click ripples using `zwlr_layer_shell_v1` on Linux Wayland, `WS_EX_LAYERED` + `WDA_EXCLUDEFROMCAPTURE` on Windows, or a dedicated main-thread AppKit `NSWindow` (`NSWindowSharingNone`) on macOS. Moving your physical mouse never aborts active batches by default; your physical cursor is restored immediately after each click. Preview it non-destructively with `python3 scripts/computer_use_mcp.py --demo-cursor`.
+While the agent clicks a target, a click-through cyan AI pointer glides along an ease-in-out curve at 120Hz on the overlay thread (`0.008 ms` call time, no blocking sleep on the action path) and plays expanding click ripples using `zwlr_layer_shell_v1` on Linux Wayland, `WS_EX_LAYERED` + `WDA_EXCLUDEFROMCAPTURE` on Windows, or a dedicated main-thread AppKit `NSWindow` (`NSWindowSharingNone`) on macOS. Moving your physical mouse never aborts active batches by default; your physical cursor is restored immediately after each click. Preview it non-destructively with `python3 scripts/computer_use_mcp.py --demo-cursor`.
 
 ### Background Computer Use (Linux, Windows, and macOS)
 
@@ -93,8 +86,8 @@ Pass `background: true` (after `desktop_background`) to automate apps without mo
 
 | Tool | Purpose |
 | --- | --- |
-| `desktop_observe` | 1-call window list + active app AT-SPI2/UIA/`AXUIElement` `[ref]` tree (`AX_DIFF` on repeat calls) + zero-image `mode: "ocr"` clickable `[x,y]` text + automatic 47 KB `896px` JPEG screenshot with `0..1000` grid when AX has fewer than 5 elements. |
-| `desktop_act` | Execute batched bursts (`open_url`, `wait_and_click`, `click_and_type`, `keys`, `repeat`, `click`, `move`/`hover`, `drag`, `scroll`, `type`, `key`/`hotkey`, `ax_action`, `focus`, `window`, `launch`, `wait`, `screenshot`) with 0.008 ms non-blocking 120Hz cyan cursor glide, local AX+OCR text targeting, and `observe: "none"` fast bursts. Supports `background: true`. |
+| `desktop_observe` | 1-call window list + active app AT-SPI2/UIA/`AXUIElement` `[ref]` tree (`AX_DIFF` on repeat calls) + inline `[x,y]` `OCR_TEXT` on sparse-AX apps (no image offload) + `896px` JPEG fallback when OCR has <5 words or `mode: "vision"` is requested. |
+| `desktop_act` | Execute batched steps (`launch`, `open_url`, `wait_and_click`, `click_and_type`, `keys`, `repeat`, `click`, `move`/`hover`, `drag`, `scroll`, `type`, `key`/`hotkey`, `ax_action`, `focus`, `window`, `wait`, `screenshot`) with non-blocking 120Hz cyan cursor glide, local AX+OCR text targeting, and `observe: "none"` fast bursts. Supports `background: true`. |
 | `desktop_background` | Start, attach, launch into, inspect, or stop a background session (`Xvfb` on Linux, `PrintWindow` + `PostMessageW` on Windows, `CGWindowList` + `AXPress`/`CGEventPostToPid` on macOS). |
 | `desktop_screenshot` | Capture `screen`, `active`, `window`, `area`, `ref`, or `background` with optional Set-of-Marks `[ref]` badges, `0..1000` coordinate grid, and `diff_from_last`. |
 | `desktop_windows` | List, focus, minimize, maximize, unmaximize, move/resize, close, or launch desktop windows. |
@@ -117,10 +110,11 @@ python3 scripts/computer_use_mcp.py --demo-cursor
 python3 -m unittest discover -s tests -v
 ```
 
-Set `COMPUTER_USE_AUDIT_LOG=/path/to/audit.jsonl` to log every tool call and latency to JSONL. Set `COMPUTER_USE_OVERLAY=0` or `COMPUTER_USE_SMOOTH_CURSOR=0` to disable the custom cursor overlay or smooth glide. Set `COMPUTER_USE_ENABLE_SCREENREADER=1` on Linux only if you want `org.a11y.Status.ScreenReaderEnabled` toggled on for Chromium/Electron AT-SPI2 trees (restored on exit).
+Set `COMPUTER_USE_AUDIT_LOG=/path/to/audit.jsonl` to log every tool call and latency to JSONL. Set `COMPUTER_USE_OVERLAY=0` or `COMPUTER_USE_SMOOTH_CURSOR=0` to disable the custom cursor overlay or smooth glide. Set `COMPUTER_USE_HOT_RELOAD=0` to disable automatic in-process script reload on disk updates. Set `COMPUTER_USE_ENABLE_SCREENREADER=1` on Linux only if you want `org.a11y.Status.ScreenReaderEnabled` toggled on for Chromium/Electron AT-SPI2 trees (restored on exit).
 
 ## Limitations
 
+- Total wall-clock time on multi-step tasks still depends on cloud LLM latency (typically 1 to 3 seconds per model turn). Inline local OCR and compound ops reduce the number of turns, but a task that needs 3 model turns will still spend most of its wall-clock time waiting on the model rather than local input/capture.
 - On macOS, clicking, typing, and `AXUIElement` trees require Accessibility permission, and capturing other apps' windows requires Screen Recording permission (System Settings -> Privacy & Security).
 - Local OCR text targeting uses system `libtesseract` when installed (`tesseract` + `tesseract-data-eng` on Linux, `brew install tesseract` on macOS, or Tesseract-OCR on Windows). Without it, accessibility trees and `0..1000` grid coordinates still work normally.
 - Windows (`PrintWindow` + `PostMessageW`) and macOS (`CGWindowList` + `CGEventPostToPid`) background modes require the target window to be unminimized (it can sit behind other windows); some GPU-composited or raw-input apps ignore background posted events unless focused.

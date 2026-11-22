@@ -22,6 +22,7 @@ Highlights:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -41,7 +42,7 @@ from cursor_overlay import CursorOverlay
 from fast_ocr import FastOCR, format_ocr_compact
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.3.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -51,13 +52,13 @@ _LINUX_SHIFT_V_TERMINALS = (
 _WIN_SHIFT_V_TERMINALS = ("windowsterminal", "wezterm", "alacritty", "kitty", "mintty")
 
 SERVER_INSTRUCTIONS = (
-    "Superhuman-speed Linux, Windows, and macOS Computer Use MCP server. Act first without wasted "
-    "screenshots: chain multi-step workflows in ONE desktop_act call using compound ops (open_url, "
-    "wait_and_click, click_and_type, click(text=...), keys, repeat, focus, launch) with observe='none' "
-    "on predictable bursts. Text targets resolve locally via AX/UIA/AXUIElement + 8-thread parallel OCR "
-    "with zero extra LLM round-trips, and the cyan AI cursor glides non-blocking at 120Hz while "
-    "preserving your physical mouse. Use desktop_observe(mode='ocr') for zero-image text coords or "
-    "desktop_background + background=true for off-screen automation."
+    "Fast native Linux, Windows, and macOS Computer Use MCP server. Minimize LLM turns: chain full "
+    "workflows inside ONE desktop_act call using launch, focus, open_url, wait_and_click, click_and_type, "
+    "click(text=...), keys, repeat, and wait(change=true, timeout_ms=800) with observe='none' on intermediate "
+    "bursts. Text targets resolve locally via AX/UIA/AXUIElement + 8-thread parallel OCR, and sparse-AX apps "
+    "(Discord, Brave, Electron, VS Code) return inline [x,y] OCR_TEXT without offloading screenshots to disk "
+    "(pass mode='vision' or screenshot=true only for textless icons). Never insert blind 400-1000 ms sleeps "
+    "between UI steps; use wait_and_click or wait(change=true). Moving your mouse does not abort by default."
 )
 
 
@@ -908,12 +909,22 @@ class DesktopEngine:
             lines.append(ax_res["formatted"])
 
         n_ax = len(ax_res["elements"]) if ax_res else 0
+        explicit_ss: bool | None = None
         if ss_opt is True or str(ss_opt).lower() == "true":
-            want_ss = True
+            explicit_ss = True
         elif ss_opt is False or str(ss_opt).lower() == "false":
+            explicit_ss = False
+
+        # In hybrid mode on sparse-AX apps (Discord, Brave, Electron, VS Code), prefer inline OCR_TEXT
+        # so MCP hosts that offload images to disk don't force an extra read_file turn!
+        auto_ocr = (mode == "hybrid") and (n_ax < 5) and (explicit_ss is not True) and self.ocr.available
+        want_ocr = want_ocr or auto_ocr
+        if explicit_ss is True:
+            want_ss = True
+        elif explicit_ss is False:
             want_ss = False
         else:
-            want_ss = (mode == "vision") or (mode == "hybrid" and n_ax < 5)
+            want_ss = (mode == "vision") or (mode == "hybrid" and n_ax < 5 and not auto_ocr)
 
         content: list[dict[str, Any]] = []
         frame: Frame | None = None
@@ -922,15 +933,23 @@ class DesktopEngine:
             if self.capture.backend != "unavailable":
                 frame = self.capture.capture(scope=scope, active_rect=active_rect, include_cursor=want_ss)
 
+        ocr_word_count = 0
         if want_ocr and frame is not None:
             t_ocr = time.perf_counter()
             words = self.ocr.scan_frame(frame)
             if find_q:
                 fq = str(find_q).lower()
                 words = [w for w in words if fq in w["text"].lower()]
+            ocr_word_count = len(words)
             ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
-            lines.append(f"OCR_TEXT ({len(words)} words, {ocr_ms:.1f}ms):")
+            lines.append(f"OCR_TEXT ({ocr_word_count} words, {ocr_ms:.1f}ms):")
             lines.append(format_ocr_compact(words))
+            if auto_ocr and explicit_ss is None:
+                if ocr_word_count >= 5:
+                    lines.append("OCR_INLINE: exact [x,y] labels above (pass mode='vision' or screenshot=true only for textless icons).")
+                else:
+                    # Pure icon/canvas screen (<5 OCR words): fall back to grid screenshot automatically
+                    want_ss = True
 
         if want_ss and frame is not None:
             diff_px = self.capture.diff_from_last(frame, ignore_rects=self._overlay_ignore_rects())
@@ -1125,19 +1144,47 @@ class DesktopEngine:
             lines.append(f"{hdr} ({ax_res['elapsed_ms']}ms):\n{ax_res['formatted']}")
 
         want_img = False
+        want_inline_ocr = False
         crop_to_diff = False
         if observe_opt == "vision" or args.get("screenshot") is True:
             want_img = True
         elif observe_opt == "crop_changed":
             want_img = True
             crop_to_diff = True
+        elif observe_opt == "ocr" and not aborted_takeover:
+            want_inline_ocr = True
         elif observe_opt == "auto" and not aborted_takeover:
             n_ax = len(ax_res["elements"]) if ax_res else 0
             if n_ax < 5:
-                want_img = True
+                if self.ocr.available:
+                    want_inline_ocr = True
+                else:
+                    want_img = True
+
+        obs_frame: Frame | None = after_frame
+        if want_inline_ocr and self.capture.backend != "unavailable":
+            if obs_frame is None:
+                if active_after and int(active_after.get("w", 0)) >= 120 and int(active_after.get("h", 0)) >= 100:
+                    aw_r = (
+                        int(active_after["x"]), int(active_after["y"]),
+                        int(active_after["w"]), int(active_after["h"]),
+                    )
+                    obs_frame = self.capture.capture(scope="area", area=aw_r, include_cursor=False)
+                else:
+                    obs_frame = self.capture.capture(scope="screen", include_cursor=False)
+            t_ocr = time.perf_counter()
+            words = self.ocr.scan_frame(obs_frame)
+            ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
+            lines.append(f"OCR_TEXT ({len(words)} words, {ocr_ms:.1f}ms):")
+            lines.append(format_ocr_compact(words))
+            if observe_opt == "auto":
+                if len(words) >= 5:
+                    lines.append("OCR_INLINE: exact [x,y] labels above (pass observe='vision' or screenshot=true only for textless icons).")
+                else:
+                    want_img = True
 
         if want_img and self.capture.backend != "unavailable":
-            frame = after_frame or self.capture.capture(scope="screen", include_cursor=False)
+            frame = obs_frame or self.capture.capture(scope="screen", include_cursor=False)
             if crop_to_diff and diff_info and diff_info.get("changed_bbox"):
                 bx, by, bw, bh = diff_info["changed_bbox"]
                 sc = frame.scale if frame.scale > 0 else 1.0
@@ -1704,8 +1751,8 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Observe the Linux, Windows, or macOS desktop in 1 call: window list + active window + cursor (~1.2 ms) "
             "+ semantic accessibility [ref] tree (AT-SPI2 / UIA / AXUIElement with incremental AX_DIFF) "
-            "+ optional parallel local OCR (mode='ocr' or ocr=true for clickable [x,y] text with zero image tokens) "
-            "+ automatic ~5 ms compact JPEG screenshot (896px) with Set-of-Marks/grid when AX has <5 elements."
+            "+ inline 8-thread parallel local OCR [x,y] labels on sparse-AX apps (zero screenshot offload) "
+            "+ compact 896px JPEG fallback when OCR has <5 words or mode='vision' / screenshot=true is requested."
         ),
         "inputSchema": {
             "type": "object",
@@ -1728,10 +1775,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "desktop_act",
         "description": (
-            "Execute batched desktop actions at superhuman speed with a 0 ms non-blocking 120Hz cyan AI cursor + "
-            "click ripples (preserving your physical mouse). Chain entire workflows in ONE call using compound ops "
-            "(open_url, wait_and_click, click_and_type, click(text=...), keys, repeat, focus, launch) with local "
-            "AX + 8-thread parallel OCR text targeting and observe='none' on predictable bursts."
+            "Execute batched desktop actions with a non-blocking 120Hz cyan AI cursor + click ripples (preserving "
+            "your physical mouse). Chain full workflows in ONE call using launch, focus, open_url, wait_and_click, "
+            "click_and_type, click(text=...), keys, repeat, and wait(change=true, timeout_ms=800). Text targets "
+            "resolve locally via AX + 8-thread parallel OCR; pass observe='none' on intermediate bursts."
         ),
         "inputSchema": {
             "type": "object",
@@ -1750,7 +1797,7 @@ TOOLS: list[dict[str, Any]] = [
                 "smooth": {"type": "boolean", "default": True},
                 "independent_cursor": {"type": "boolean", "default": True},
                 "settle": {"oneOf": [{"type": "string", "enum": ["smart", "none"]}, {"type": "integer"}], "default": "none"},
-                "observe": {"type": "string", "enum": ["auto", "ax", "vision", "crop_changed", "none"], "default": "auto"},
+                "observe": {"type": "string", "enum": ["auto", "ax", "ocr", "vision", "crop_changed", "none"], "default": "auto"},
                 "verify_change": {"type": "boolean", "default": False},
                 "detect_takeover": {"type": "boolean", "default": False},
                 "screenshot": {"type": "boolean"},
@@ -1934,12 +1981,50 @@ class MCPServer:
             "error": {"code": -32601, "message": f"Method not found: {method}"},
         }
 
+    @staticmethod
+    def _script_mtimes() -> dict[str, int]:
+        out: dict[str, int] = {}
+        try:
+            for entry in os.scandir(_SCRIPT_DIR):
+                if entry.name.endswith(".py"):
+                    out[entry.name] = entry.stat().st_mtime_ns
+        except OSError:
+            pass
+        return out
+
+    def _maybe_hot_reload(self, mtimes: dict[str, int]) -> tuple["MCPServer", dict[str, int]]:
+        """Reload scripts in-process if updated on disk so plugin upgrades apply without restarting the host."""
+        cur = self._script_mtimes()
+        if not cur or cur == mtimes:
+            return self, mtimes
+        try:
+            self.engine.shutdown()
+            import importlib.util
+
+            for mod_name in (
+                "capture", "fast_ocr", "cursor_overlay", "windows", "a11y",
+                "clipboard", "uinput_driver", "win32_backend", "macos_backend", "linux_bg",
+            ):
+                if mod_name in sys.modules:
+                    importlib.reload(sys.modules[mod_name])
+            spec = importlib.util.spec_from_file_location("computer_use_mcp_live", os.path.abspath(__file__))
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod.MCPServer(), cur
+        except Exception:
+            pass
+        return self, cur
+
     def serve_stdio(self) -> None:
         try:
             sys.stdin.reconfigure(encoding="utf-8")
             sys.stdout.reconfigure(encoding="utf-8", newline="\n")
         except Exception:
             pass
+        hot_reload = os.environ.get("COMPUTER_USE_HOT_RELOAD", "1").strip().lower() not in ("0", "false", "off")
+        mtimes = self._script_mtimes() if hot_reload else {}
+        active_srv: MCPServer = self
         try:
             for line in sys.stdin:
                 line = line.strip()
@@ -1954,12 +2039,14 @@ class MCPServer:
                     )
                     sys.stdout.flush()
                     continue
-                resp = self.handle_request(req)
+                if hot_reload and isinstance(req, dict) and req.get("method") in ("tools/call", "tools/list"):
+                    active_srv, mtimes = active_srv._maybe_hot_reload(mtimes)
+                resp = active_srv.handle_request(req)
                 if resp is not None:
                     sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")
                     sys.stdout.flush()
         finally:
-            self.engine.shutdown()
+            active_srv.engine.shutdown()
 
 
 # ---------------------------------------------------------------------------
