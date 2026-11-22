@@ -6,17 +6,17 @@ on:
   pull_request:
 
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Python native bindings (numpy, GdkPixbuf, Cairo, AT-SPI2)
+      - name: Install Linux native bindings (numpy, GdkPixbuf, Cairo, TurboJPEG, AT-SPI2, Xvfb)
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-numpy python3-gi python3-cairo gir1.2-gdkpixbuf-2.0 gir1.2-atspi-2.0
-      - name: Run unit and protocol tests
+          sudo apt-get install -y python3-numpy python3-gi python3-cairo gir1.2-gdkpixbuf-2.0 gir1.2-atspi-2.0 libturbojpeg0 xvfb xdotool
+      - name: Run unit, TurboJPEG, Cairo, Xvfb background, and stdio protocol tests
         run: /usr/bin/python3 -m unittest discover -s tests -v
-      - name: Validate plugin.json and mcp_config.json
+      - name: Validate manifests
         run: |
           /usr/bin/python3 -c '
           import json
@@ -25,5 +25,27 @@ jobs:
           assert len(p["suggestedPrompts"]) == 3
           m = json.load(open("mcp_config.json"))
           assert "computer-use" in m["mcpServers"]
-          print("Manifest validation passed")
+          print("Linux manifest validation passed")
           '
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numpy
+        run: python -m pip install --upgrade pip numpy
+      - name: Run Windows Win32 unit, GDI/GDI+, Clipboard, UIA COM, Overlay, and stdio protocol tests
+        run: python -m unittest discover -s tests -v
+      - name: Run non-destructive Windows selftest
+        run: python scripts/computer_use_mcp.py --selftest
+      - name: Test install.ps1 installer into temporary directory
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP "agcu-plugin-test"
+          $env:ANTIGRAVITY_PLUGIN_DIR = $tmp
+          ./install.ps1
+          python -c "import json, os; d = json.load(open(os.path.join(r'$tmp', 'mcp_config.json'), encoding='utf-8')); srv = d['mcpServers']['computer-use']; assert isinstance(srv['args'], list) and len(srv['args']) == 1 and os.path.isfile(srv['args'][0]); print('install.ps1 verified OK')"

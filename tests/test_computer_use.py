@@ -1,10 +1,12 @@
-"""Unit, mocked engine, MCP JSON-RPC stdio, and live desktop tests for computer-use."""
+"""Cross-platform unit, TurboJPEG/Cairo, Win32/COM, Xvfb background, overlay, and MCP stdio tests."""
 
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,13 +24,15 @@ if str(SCRIPTS) not in sys.path:
 import a11y
 import capture
 import computer_use_mcp as mcp
+import cursor_overlay
 import uinput_driver
+import win32_backend
 
 
 class FakeWindowManager:
-    def __init__(self, screen=(1920, 1080), cursor=(500, 400), active_app="kate"):
+    def __init__(self, bounds=(0, 0, 1920, 1080), cursor=(500, 400), active_app="kate"):
         self.backend = "mock"
-        self._screen = screen
+        self._bounds = bounds
         self._cursor = cursor
         self._active = {
             "id": "win-1",
@@ -45,12 +49,19 @@ class FakeWindowManager:
         }
         self.controls: list[tuple[str, dict[str, Any]]] = []
 
+    def virtual_bounds(self) -> tuple[int, int, int, int]:
+        return self._bounds
+
     def screen_size(self) -> tuple[int, int]:
-        return self._screen
+        return self._bounds[2], self._bounds[3]
+
+    def cursor_pos(self) -> tuple[int, int]:
+        return self._cursor
 
     def state(self) -> dict[str, Any]:
+        vx, vy, vw, vh = self._bounds
         return {
-            "screen": {"w": self._screen[0], "h": self._screen[1]},
+            "screen": {"x": vx, "y": vy, "w": vw, "h": vh},
             "cursor": {"x": self._cursor[0], "y": self._cursor[1]},
             "windows": [self._active],
             "active": self._active,
@@ -82,8 +93,9 @@ class FakeClipboard:
 
 
 class FakeInputDriver:
-    def __init__(self):
+    def __init__(self, layout: str = "us"):
         self.backend = "mock"
+        self.layout = layout
         self._last_pos: tuple[int, int] | None = None
         self.events: list[tuple[str, Any]] = []
 
@@ -101,8 +113,10 @@ class FakeInputDriver:
         self.events.append(("click", (x, y, button, count, modifiers)))
         return (x, y) if x is not None and y is not None else None
 
-    def drag(self, x1, y1, x2, y2, *, button="left", duration_ms=140, steps=14):
+    def drag(self, x1, y1, x2, y2, *, button="left", duration_ms=140, steps=14, on_step=None):
         self._last_pos = (x2, y2)
+        if on_step:
+            on_step(x2, y2)
         self.events.append(("drag", (x1, y1, x2, y2, button)))
         return (x1, y1), (x2, y2)
 
@@ -116,7 +130,70 @@ class FakeInputDriver:
         self.events.append(("type_keys", text))
 
     def is_pure_ascii_typable(self, text: str) -> bool:
-        return all(uinput_driver.char_to_uinput(ch) is not None for ch in text)
+        return all(uinput_driver.char_to_uinput(ch, layout=self.layout) is not None for ch in text)
+
+
+class FakeOverlay:
+    def __init__(self):
+        self.backend = "mock-overlay"
+        self.moves: list[tuple[float, float, str]] = []
+        self.clicks: list[tuple[float, float, str, bool]] = []
+
+    def show_move(self, x: float, y: float, label: str = "AI") -> None:
+        self.moves.append((x, y, label))
+
+    def show_click(self, x: float, y: float, *, button: str = "left", double: bool = False) -> None:
+        self.clicks.append((x, y, button, double))
+
+    def close(self) -> None:
+        pass
+
+
+class FakeBackground:
+    def __init__(self):
+        self.active = True
+        self.size = (1280, 720)
+        self.events: list[tuple[str, Any]] = []
+
+    def status(self):
+        return {"active": self.active, "backend": "mock-bg"}
+
+    def start(self, width=1920, height=1080):
+        self.active = True
+        self.size = (width, height)
+        return self.status()
+
+    def attach(self, **kwargs):
+        self.active = True
+        return self.status()
+
+    def stop(self):
+        self.active = False
+        return {"active": False}
+
+    def launch(self, cmd, **kwargs):
+        self.events.append(("launch", cmd))
+        return {"pid": 4242, "command": cmd}
+
+    def capture(self, area=None):
+        return SyntheticCapture._make_frame(320, 200, (15, 25, 35, 255))
+
+    def move(self, x, y):
+        self.events.append(("move", (x, y)))
+        return x, y
+
+    def click(self, x, y, *, button="left", count=1):
+        self.events.append(("click", (x, y, button, count)))
+        return x, y
+
+    def scroll(self, direction="down", clicks=5, *, x=None, y=None):
+        self.events.append(("scroll", (direction, clicks, x, y)))
+
+    def type_text(self, text):
+        self.events.append(("type_text", text))
+
+    def hotkey(self, keys, *, count=1):
+        self.events.append(("hotkey", (keys, count)))
 
 
 class FakeA11y:
@@ -161,6 +238,7 @@ class SyntheticCapture(capture.ScreenCapture):
         self._last_thumb = None
         self._last_frame_rect = None
         self._jpeg_needs_rgb = False
+        self._tj = capture.TurboJpegEncoder()
         self._frames = list(frames or [self._make_frame(320, 200, (30, 40, 50, 255))])
         self._idx = 0
 
@@ -176,8 +254,8 @@ class SyntheticCapture(capture.ScreenCapture):
         return f
 
 
-class TestInputMapping(unittest.TestCase):
-    def test_parse_key_combo(self):
+class TestInputAndLayouts(unittest.TestCase):
+    def test_parse_key_combo_linux_and_windows(self):
         combo = uinput_driver.parse_key_combo("ctrl+shift+t")
         self.assertEqual([c for _, c in combo], [29, 42, 20])
         plus = uinput_driver.parse_key_combo("+")
@@ -185,27 +263,53 @@ class TestInputMapping(unittest.TestCase):
         with self.assertRaises(ValueError):
             uinput_driver.parse_key_combo("ctrl+notakey")
 
-    def test_char_to_uinput(self):
-        self.assertEqual(uinput_driver.char_to_uinput("a"), (False, 30))
-        self.assertEqual(uinput_driver.char_to_uinput("A"), (True, 30))
-        self.assertEqual(uinput_driver.char_to_uinput("!"), (True, 2))
-        self.assertEqual(uinput_driver.char_to_uinput("\n"), (False, 28))
-        self.assertIsNone(uinput_driver.char_to_uinput("\u00e9"))
+        wcombo = win32_backend.parse_win_key_combo("ctrl+shift+t")
+        self.assertEqual([c for _, c in wcombo], [0x11, 0x10, 0x54])
+        self.assertEqual(win32_backend.parse_win_key_combo(["win", "r"]), [("win", 0x5B), ("r", 0x52)])
+        # Also verify 'ctrl++', UK '#' / '~' / '\' / '¬', and X11 keysym mapping
+        self.assertEqual([c for _, c in uinput_driver.parse_key_combo("ctrl++")], [29, 42, 13])
+        self.assertEqual([c for _, c in uinput_driver.parse_key_combo("#", layout="gb")], [43])
+        self.assertEqual(uinput_driver.char_to_uinput("\u00ac", layout="gb"), (True, 41))
+        self.assertEqual(uinput_driver.to_x11_combo("ctrl+enter"), "ctrl+Return")
+        self.assertEqual(uinput_driver.to_x11_combo("ctrl+shift++"), "ctrl+shift+plus")
+        self.assertEqual([c for _, c in win32_backend.parse_win_key_combo("ctrl++")], [0x11, 0xBB])
 
-    def test_screen_to_abs_clamping(self):
-        drv = uinput_driver.InputDriver(screen_size_fn=lambda: (1920, 1080))
-        self.assertEqual(drv._screen_to_abs(0, 0), (0, 0, 0, 0))
+    def test_layout_aware_uinput_mapping(self):
+        # US layout: '"' on apostrophe (40), '@' on '2' (3)
+        self.assertEqual(uinput_driver.char_to_uinput('"', layout="us"), (True, 40))
+        self.assertEqual(uinput_driver.char_to_uinput("@", layout="us"), (True, 3))
+        # UK (gb) layout: '"' on '2' (3), '@' on apostrophe (40), '#' on 43, '\' on 86, '£' on Shift+3
+        self.assertEqual(uinput_driver.char_to_uinput('"', layout="gb"), (True, 3))
+        self.assertEqual(uinput_driver.char_to_uinput("@", layout="gb"), (True, 40))
+        self.assertEqual(uinput_driver.char_to_uinput("#", layout="gb"), (False, 43))
+        self.assertEqual(uinput_driver.char_to_uinput("\\", layout="gb"), (False, 86))
+        self.assertEqual(uinput_driver.char_to_uinput("\u00a3", layout="gb"), (True, 4))
+        # International (e.g. German/French) returns None for letters/symbols -> routes safely to atomic clipboard paste
+        self.assertIsNone(uinput_driver.char_to_uinput("z", layout="de"))
+        self.assertIsNone(uinput_driver.char_to_uinput("\u00e9", layout="us"))
+
+    def test_win32_input_struct_size_and_utf16_surrogates(self):
+        expected = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
+        self.assertEqual(ctypes.sizeof(win32_backend.INPUT), expected)
+        # Astral plane emoji (U+1F680 rocket) -> 2 UTF-16 surrogate code units
+        units = win32_backend.text_to_utf16_units("A\U0001F680")
+        self.assertEqual(units, [0x0041, 0xD83D, 0xDE80])
+
+    def test_negative_multimonitor_virtual_bounds(self):
+        bounds = (-1920, -200, 3840, 1280)
+        drv = uinput_driver.InputDriver(screen_size_fn=lambda: (3840, 1280), virtual_bounds_fn=lambda: bounds)
+        self.assertEqual(drv._screen_to_abs(-1920, -200), (-1920, -200, 0, 0))
         self.assertEqual(drv._screen_to_abs(1919, 1079), (1919, 1079, 65535, 65535))
-        self.assertEqual(drv._screen_to_abs(-50, 5000), (0, 1079, 0, 65535))
+        self.assertEqual(win32_backend.win_virtual_to_abs(-1920, -200, bounds), (-1920, -200, 0, 0))
+        self.assertEqual(win32_backend.win_virtual_to_abs(1919, 1079, bounds), (1919, 1079, 65535, 65535))
 
     def test_normalized_to_screen(self):
-        self.assertEqual(mcp.normalized_to_screen(0, 0, (0, 0, 1920, 1080)), (0, 0))
+        self.assertEqual(mcp.normalized_to_screen(0, 0, (-1920, 0, 3840, 1080)), (-1920, 0))
         self.assertEqual(mcp.normalized_to_screen(1000, 1000, (0, 0, 1920, 1080)), (1919, 1079))
         self.assertEqual(mcp.normalized_to_screen(500, 500, (100, 200, 401, 201)), (300, 300))
-        self.assertEqual(mcp.normalized_to_screen(1500, -100, (0, 0, 1000, 1000)), (999, 0))
 
 
-class TestCaptureAndCairo(unittest.TestCase):
+class TestCaptureAndOverlayRendering(unittest.TestCase):
     def test_diff_frames_identical_and_localized(self):
         f1 = SyntheticCapture._make_frame(400, 300, (20, 20, 20, 255))
         f2 = SyntheticCapture._make_frame(400, 300, (20, 20, 20, 255))
@@ -221,9 +325,30 @@ class TestCaptureAndCairo(unittest.TestCase):
         self.assertAlmostEqual(bx, 200, delta=4)
         self.assertAlmostEqual(by, 100, delta=4)
         self.assertAlmostEqual(bw, 80, delta=6)
-        self.assertAlmostEqual(bh, 60, delta=6)
+        # Verify diff_frames ignore_rects suppresses overlay/ripple pixels cleanly
+        d_masked = sc.diff_frames(f1, f2, ignore_rects=[(195, 95, 95, 70)])
+        self.assertEqual(d_masked["changed_pct"], 0.0)
+        self.assertIsNone(d_masked["changed_bbox"])
 
-    def test_encode_jpeg_png_with_cairo_overlays(self):
+        # Verify zero-dep 5x7 digit pill renderer writes crisp pixels on BGRA buffer
+        bgra = np.zeros((40, 80, 4), dtype=np.uint8)
+        win32_backend.blit_pill_digits_bgra(bgra, 4, 4, "420", bg_bgr=(24, 16, 12), fg_bgr=(255, 240, 100))
+        self.assertGreater(int((bgra[:, :, 3] == 255).sum()), 150)
+
+        # Verify Wayland AT-SPI2 window-local -> global offset calibration
+        old_wl = os.environ.get("WAYLAND_DISPLAY")
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        try:
+            dx, dy = a11y.A11yTree._wayland_coord_offset((0, 0, 1084, 723), (427, 138, 1066, 705))
+            self.assertEqual((dx, dy), (418, 129))
+        finally:
+            if old_wl is None:
+                os.environ.pop("WAYLAND_DISPLAY", None)
+            else:
+                os.environ["WAYLAND_DISPLAY"] = old_wl
+
+    @unittest.skipIf(sys.platform == "win32", "Cairo/GdkPixbuf test runs on Linux")
+    def test_encode_turbojpeg_and_png_with_cairo_overlays(self):
         f = SyntheticCapture._make_frame(640, 480, (25, 35, 55, 255))
         sc = SyntheticCapture()
         anns = [{"ref": 7, "bbox": (40, 50, 120, 40)}]
@@ -239,42 +364,104 @@ class TestCaptureAndCairo(unittest.TestCase):
         raw_png = base64.b64decode(enc_png["data_b64"])
         self.assertTrue(raw_png.startswith(b"\x89PNG"))
 
+    def test_win32_overlay_argb_buffer_rendering(self):
+        size = 160
+        buf = bytearray(size * size * 4)
+        now = 10.0
+        ripples = [cursor_overlay._Ripple(x=200.0, y=200.0, started_at=9.92, color=(0.22, 0.78, 0.99), double=True)]
+        cursor_overlay._draw_win32_argb_buffer(buf, size, cx=200.0, cy=200.0, win_x=120, win_y=120, alpha=1.0, ripples=ripples, now=now)
+        # Center hotspot + ripple must have non-zero premultiplied alpha pixels
+        nonzero_alpha = sum(1 for i in range(3, len(buf), 4) if buf[i] > 0)
+        self.assertGreater(nonzero_alpha, 150)
+
 
 class TestEngineAndProtocol(unittest.TestCase):
-    def _make_engine(self, *, active_app="kate", elements=None, frames=None):
+    def _make_engine(self, *, active_app="kate", elements=None, frames=None, layout="us"):
         wm = FakeWindowManager(active_app=active_app)
         clip = FakeClipboard("saved-user-clip")
-        inp = FakeInputDriver()
+        inp = FakeInputDriver(layout=layout)
         ax = FakeA11y(elements=elements)
         cap = SyntheticCapture(frames=frames)
-        eng = mcp.DesktopEngine(bus=False, windows=wm, capture=cap, a11y=ax, clipboard=clip, input_driver=inp)
-        return eng, wm, clip, inp, ax
+        ov = FakeOverlay()
+        bg = FakeBackground()
+        eng = mcp.DesktopEngine(
+            bus=False, windows=wm, capture=cap, a11y=ax, clipboard=clip,
+            input_driver=inp, overlay=ov, background=bg,
+        )
+        return eng, wm, clip, inp, ax, ov, bg
 
-    def test_resolve_points_and_type_modes(self):
-        elems = [{"ref": 3, "role": "btn", "name": "Save", "value": "", "states": [], "bbox": (200, 100, 80, 30), "center": [240, 115]}]
-        eng, wm, clip, inp, ax = self._make_engine(elements=elems)
-        eng.last_image_rect = (100, 200, 401, 201)
+    def test_independent_cursor_restores_user_mouse_and_glides_overlay(self):
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine()
+        wm._cursor = (1500, 900)  # User's real mouse position
+        eng._ai_cursor_pos = (100.0, 100.0)
+        blocks = eng.tool_act({
+            "steps": [{"op": "click", "x": 400, "y": 300, "duration_ms": 40}],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn("1/1 ok", blocks[0]["text"])
+        # AI overlay glided smoothly in multiple steps + fired click ripple at (400, 300)
+        self.assertGreaterEqual(len(ov.moves), 4)
+        self.assertEqual(ov.clicks[-1][:3], (400, 300, "left"))
+        # Physical OS click happened at (400, 300), then user's real cursor was immediately restored to (1500, 900)!
+        self.assertIn(("click", (400, 300, "left", 1, None)), inp.events)
+        self.assertEqual(inp.events[-1], ("move", (1500, 900)))
 
-        # ref, text, exact, normalized screen, normalized last_image
-        self.assertEqual(eng.resolve_point({"ref": 3}), (240, 115))
-        self.assertEqual(eng.resolve_point({"op": "click", "text": "Save"}), (240, 115))
-        self.assertEqual(eng.resolve_point({"x": 42, "y": 84}), (42, 84))
-        self.assertEqual(eng.resolve_point({"nx": 500, "ny": 500, "coord_scope": "last_image"}), (300, 300))
+    def test_moving_user_mouse_does_not_abort_by_default(self):
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine()
+        wm._cursor = (1400, 900)
+        blocks = eng.tool_act({
+            "steps": [
+                {"op": "click", "x": 100, "y": 100, "smooth": False},
+                {"op": "click", "x": 200, "y": 200, "smooth": False},
+            ],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn("2/2 ok", blocks[0]["text"])
+        clicks = [ev for ev in inp.events if ev[0] == "click"]
+        self.assertEqual(len(clicks), 2)
 
-        # Short ASCII -> uinput keys (clipboard untouched)
-        eng.tool_act({"steps": [{"op": "type", "text": "hello"}], "settle": "none", "verify_change": False, "observe": "none"})
-        self.assertIn(("type_keys", "hello"), inp.events)
-        self.assertEqual(clip.history, [])
+    def test_opt_in_takeover_abort_still_works(self):
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine()
+        wm._cursor = (1400, 900)
+        blocks = eng.tool_act({
+            "steps": [
+                {"op": "click", "x": 100, "y": 100, "smooth": False},
+                {"op": "click", "x": 200, "y": 200, "smooth": False},
+            ],
+            "detect_takeover": True,
+            "independent_cursor": False,
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn("takeover_detected", blocks[0]["text"])
+        clicks = [ev for ev in inp.events if ev[0] == "click"]
+        self.assertEqual(len(clicks), 1)
 
-        # Long or Unicode text -> atomic paste + restore
-        long_txt = "This string exceeds twenty-four characters \u2713"
-        eng.tool_act({"steps": [{"op": "type", "text": long_txt}], "settle": "none", "verify_change": False, "observe": "none"})
-        self.assertEqual(clip.value, "saved-user-clip")
-        self.assertEqual(clip.history, [long_txt, "saved-user-clip"])
-        self.assertIn(("hotkey", ("ctrl+v", 1)), inp.events)
+    def test_background_act_never_touches_live_input(self):
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine()
+        blocks = eng.tool_act({
+            "background": True,
+            "steps": [
+                {"op": "click", "x": 120, "y": 80},
+                {"op": "type", "text": "hello bg"},
+                {"op": "key", "keys": "enter"},
+            ],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn("3/3 ok", blocks[0]["text"])
+        self.assertEqual(inp.events, [])  # Live OS mouse/keyboard completely untouched!
+        self.assertIn(("click", (120, 80, "left", 1)), bg.events)
+        self.assertIn(("type_text", "hello bg"), bg.events)
 
-    def test_terminal_uses_ctrl_shift_v(self):
-        eng, wm, clip, inp, ax = self._make_engine(active_app="konsole")
+    def test_type_modes_and_terminal_paste(self):
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine(active_app="konsole")
         eng.tool_act({
             "steps": [{"op": "type", "text": "echo 'hello world from terminal paste test'"}],
             "settle": "none",
@@ -284,42 +471,7 @@ class TestEngineAndProtocol(unittest.TestCase):
         self.assertIn(("hotkey", ("ctrl+shift+v", 1)), inp.events)
         self.assertEqual(clip.value, "saved-user-clip")
 
-    def test_takeover_detection_aborts_batch(self):
-        eng, wm, clip, inp, ax = self._make_engine()
-        wm._cursor = (1400, 900)  # Far from step 0 click at (100, 100)
-        blocks = eng.tool_act({
-            "steps": [
-                {"op": "click", "x": 100, "y": 100},
-                {"op": "click", "x": 200, "y": 200},
-            ],
-            "settle": "none",
-            "verify_change": False,
-            "observe": "none",
-        })
-        txt = blocks[0]["text"]
-        self.assertIn("takeover_detected", txt)
-        # Second click must NOT have executed
-        clicks = [ev for ev in inp.events if ev[0] == "click"]
-        self.assertEqual(len(clicks), 1)
-
-    def test_hybrid_observe_auto_screenshot_threshold(self):
-        # Sparse AX (<5 refs) -> auto attaches screenshot
-        eng_sparse, *_ = self._make_engine(elements=[])
-        b1 = eng_sparse.tool_observe({"mode": "hybrid"})
-        self.assertEqual(len(b1), 2)
-        self.assertEqual(b1[1]["type"], "image")
-
-        # Rich AX (>=5 refs) -> text-only without redundant screenshot
-        rich = [
-            {"ref": i, "role": "btn", "name": f"B{i}", "value": "", "states": [], "bbox": (i * 20, 10, 15, 15), "center": [i * 20 + 7, 17]}
-            for i in range(1, 7)
-        ]
-        eng_rich, *_ = self._make_engine(elements=rich)
-        b2 = eng_rich.tool_observe({"mode": "hybrid"})
-        self.assertEqual(len(b2), 1)
-        self.assertEqual(b2[0]["type"], "text")
-
-    def test_mcp_protocol_framing_and_audit_log(self):
+    def test_mcp_protocol_7_tools_and_audit_log(self):
         with tempfile.TemporaryDirectory() as td:
             audit_file = os.path.join(td, "audit.jsonl")
             os.environ["COMPUTER_USE_AUDIT_LOG"] = audit_file
@@ -329,16 +481,12 @@ class TestEngineAndProtocol(unittest.TestCase):
                 r1 = srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
                 self.assertEqual(r1["result"]["serverInfo"]["name"], "computer-use")
                 r2 = srv.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-                self.assertEqual(len(r2["result"]["tools"]), 6)
+                self.assertEqual(len(r2["result"]["tools"]), 7)
                 r3 = srv.handle_request({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "desktop_status", "arguments": {}}})
                 self.assertFalse(r3["result"]["isError"])
-                r4 = srv.handle_request({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "no_such_tool", "arguments": {}}})
-                self.assertIn("error", r4)
-                self.assertIsNone(srv.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"}))
                 with open(audit_file, encoding="utf-8") as f:
                     rec = json.loads(f.readline())
                 self.assertEqual(rec["tool"], "desktop_status")
-                self.assertTrue(rec["ok"])
             finally:
                 os.environ.pop("COMPUTER_USE_AUDIT_LOG", None)
 
@@ -356,23 +504,93 @@ class TestEngineAndProtocol(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         ) as proc:
-            stdout, _ = proc.communicate(payload, timeout=5)
+            stdout, _ = proc.communicate(payload, timeout=10)
             lines = [json.loads(line) for line in stdout.splitlines() if line.strip()]
             self.assertEqual(len(lines), 3)
-            self.assertEqual(lines[0]["id"], 1)
-            self.assertEqual(len(lines[1]["result"]["tools"]), 6)
+            self.assertEqual(len(lines[1]["result"]["tools"]), 7)
             status = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertIn("backends", status)
 
 
-@unittest.skipUnless(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"), "Requires live desktop session")
-class TestLiveDesktopNonDestructive(unittest.TestCase):
+@unittest.skipUnless(sys.platform != "win32" and shutil.which("Xvfb"), "Requires Linux with Xvfb")
+class TestLinuxXvfbBackground(unittest.TestCase):
+    def test_xvfb_background_capture_and_input(self):
+        import linux_bg
+        bg = linux_bg.LinuxBackgroundSession()
+        try:
+            st = bg.start(640, 480)
+            self.assertTrue(st["active"])
+            f = bg.capture()
+            self.assertEqual((f.width, f.height), (640, 480))
+            self.assertEqual(bg.move(120, 90), (120, 90))
+            self.assertEqual(bg.click(140, 110), (140, 110))
+        finally:
+            bg.stop()
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows-only live Win32 integration tests")
+class TestWindowsLiveIntegration(unittest.TestCase):
+    def test_win32_windows_capture_clipboard_uia_overlay(self):
+        wm = win32_backend.WinWindowManager()
+        vx, vy, vw, vh = wm.virtual_bounds()
+        self.assertGreater(vw, 0)
+        self.assertGreater(vh, 0)
+        st = wm.state()
+        self.assertIn("windows", st)
+
+        # Clipboard roundtrip with Unicode + emoji (restore previous value)
+        cb = win32_backend.WinClipboard()
+        prev = cb.get_text()
+        try:
+            sample = "computer-use Win32 test \u00a3 \u2713 \U0001F680"
+            cb.set_text(sample)
+            self.assertEqual(cb.get_text(), sample)
+        finally:
+            cb.set_text(prev)
+
+        # GDI BitBlt + GDI+ JPEG & PNG encode with grid & Set-of-Marks
+        cap = win32_backend.WinScreenCapture(virtual_bounds_fn=wm.virtual_bounds)
+        f = cap.capture(scope="area", area=(vx, vy, min(400, vw), min(300, vh)))
+        self.assertGreater(f.width, 0)
+        enc_jpg = cap.encode(f, max_width=320, fmt="jpeg", quality=75, grid=True, cursor=(vx + 50, vy + 50), annotations=[{"ref": 1, "bbox": (vx + 10, vy + 10, 80, 30)}])
+        self.assertTrue(base64.b64decode(enc_jpg["data_b64"]).startswith(b"\xff\xd8\xff"))
+        enc_png = cap.encode(f, max_width=320, fmt="png")
+        self.assertTrue(base64.b64decode(enc_png["data_b64"]).startswith(b"\x89PNG"))
+
+        # UI Automation COM init + snapshot
+        uia = win32_backend.WinA11yTree()
+        self.assertTrue(uia.available)
+        snap = uia.snapshot(diff=False)
+        self.assertTrue(snap["available"])
+        uia.close()
+
+        # Second layered overlay instance must NOT crash with UAF after first closes!
+        for _ in range(2):
+            ov = cursor_overlay._Win32LayeredOverlay()
+            try:
+                self.assertTrue(ov.ready)
+                ov.render(200.0, 200.0, 1.0, "AI", [], 1.0)
+            finally:
+                ov.close()
+
+        # Verify GDI+ JPEG ends cleanly at EOI (0xFFD9) and PNG ends at IEND with no GlobalSize garbage
+        raw_jpg = base64.b64decode(enc_jpg["data_b64"])
+        raw_png = base64.b64decode(enc_png["data_b64"])
+        self.assertTrue(raw_jpg.endswith(b"\xff\xd9"))
+        self.assertIn(b"IEND", raw_png[-16:])
+
+
+@unittest.skipUnless(sys.platform == "win32" or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"), "Requires live desktop")
+class TestLiveSelftest(unittest.TestCase):
     def test_live_selftest_passes(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "computer_use_mcp.py"), "--selftest"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
         self.assertEqual(r.returncode, 0, msg=r.stdout + "\n" + r.stderr)

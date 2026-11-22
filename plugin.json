@@ -1,13 +1,13 @@
 {
   "name": "computer-use",
   "displayName": "Computer Use",
-  "version": "1.0.0",
-  "description": "Fast native Linux desktop automation for Antigravity over MCP: direct KWin ScreenShot2 capture, kernel /dev/uinput absolute pointer and keyboard, AT-SPI2 semantic [ref] diffs, Set-of-Marks and 0..1000 coordinate grid, window management, and atomic clipboard paste.",
+  "version": "2.0.0",
+  "description": "Ultra-fast native Linux (Wayland/X11) and Windows 10/11 desktop automation over MCP: ~5 ms TurboJPEG/KWin and Win32 GDI+ capture, smooth custom AI cursor with click ripples, independent mouse control, background mode (Xvfb / PrintWindow+PostMessage), and AT-SPI2/UIA [ref] diffs.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Observe my current desktop windows and active app elements",
-    "Take a coordinate-grid screenshot of my active window",
-    "Check my computer-use backend status and capture latency"
+    "Start a background computer-use session and launch an app there",
+    "Benchmark my computer-use backend latency and preview the AI cursor"
   ],
   "author": {
     "name": "alexander-src",

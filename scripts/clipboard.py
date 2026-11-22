@@ -8,7 +8,7 @@ import subprocess
 
 
 class Clipboard:
-    """Fast clipboard read/write using Klipper DBus (0.4 ms) with Wayland/X11 fallbacks."""
+    """Fast clipboard read/write using Klipper DBus (~0.2 ms) with Wayland/X11 fallbacks."""
 
     def __init__(self, session_bus=None):
         self._bus = session_bus
@@ -66,13 +66,23 @@ class Clipboard:
             if k is not None:
                 k.setClipboardContents(text)
                 return
+        # Use DEVNULL for stdout/stderr: xclip/wl-copy fork a selection owner daemon that inherits open pipes!
         if shutil.which("wl-copy") and os.environ.get("WAYLAND_DISPLAY"):
-            subprocess.run(["wl-copy"], input=text, text=True, check=True, capture_output=True, timeout=2)
+            subprocess.run(
+                ["wl-copy"], input=text, text=True, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            )
             return
         if shutil.which("xclip") and os.environ.get("DISPLAY"):
-            subprocess.run(["xclip", "-selection", "clipboard", "-i"], input=text, text=True, check=True, capture_output=True, timeout=2)
+            subprocess.run(
+                ["xclip", "-selection", "clipboard", "-i"], input=text, text=True, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            )
             return
         if shutil.which("xsel") and os.environ.get("DISPLAY"):
-            subprocess.run(["xsel", "--clipboard", "--input"], input=text, text=True, check=True, capture_output=True, timeout=2)
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"], input=text, text=True, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            )
             return
         raise RuntimeError("No clipboard backend available")

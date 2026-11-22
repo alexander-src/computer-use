@@ -1,7 +1,9 @@
-"""Fast Linux AT-SPI2 accessibility tree walker with stable [ref] IDs, find(), and DIFF snapshots."""
+"""Fast Linux AT-SPI2 accessibility tree walker with Wayland coord calibration, stable [ref] IDs, and diffs."""
 
 from __future__ import annotations
 
+import atexit
+import os
 import time
 from typing import Any
 
@@ -37,12 +39,16 @@ SHORT_ROLE = {
 
 
 class A11yTree:
-    """Walks AT-SPI2 with strict time/node caps, stable [ref] IDs, and incremental diffs."""
+    """Walks AT-SPI2 with strict time/node caps, Wayland global-coord offset calibration, stable [ref] IDs, and diffs."""
 
     def __init__(self, session_bus=None):
         self._bus = session_bus
         self._atspi = None
         self._enabled_tried = False
+        self._orig_is_enabled: bool | None = None
+        self._orig_sr_enabled: bool | None = None
+        self._interactive_role_ids: set[int] = set()
+        self._text_role_ids: set[int] = set()
         self._next_ref = 1
         self._key_to_ref: dict[tuple[Any, ...], int] = {}
         self._ref_map: dict[int, dict[str, Any]] = {}
@@ -50,6 +56,7 @@ class A11yTree:
         self._last_window_key: str = ""
         self._last_lines: dict[int, str] = {}
         self._available = self._init_atspi()
+        atexit.register(self.close)
 
     def _init_atspi(self) -> bool:
         try:
@@ -57,6 +64,25 @@ class A11yTree:
             gi.require_version("Atspi", "2.0")
             from gi.repository import Atspi
             self._atspi = Atspi
+            try:
+                Atspi.set_timeout(120, 250)
+            except Exception:
+                pass
+            R = Atspi.Role
+            for nm in (
+                "PUSH_BUTTON", "TOGGLE_BUTTON", "CHECK_BOX", "RADIO_BUTTON", "MENU_ITEM",
+                "CHECK_MENU_ITEM", "RADIO_MENU_ITEM", "MENU", "COMBO_BOX", "TEXT", "ENTRY",
+                "PASSWORD_TEXT", "SPIN_BUTTON", "SLIDER", "PAGE_TAB", "LINK", "LIST_ITEM",
+                "TREE_ITEM", "TABLE_CELL", "SCROLL_BAR", "ICON", "SPLIT_BUTTON", "DOCUMENT_WEB",
+            ):
+                if hasattr(R, nm):
+                    self._interactive_role_ids.add(int(getattr(R, nm)))
+            for nm in (
+                "LABEL", "HEADING", "PARAGRAPH", "STATIC", "STATUS_BAR", "ALERT",
+                "NOTIFICATION", "INFO_BAR", "CAPTION", "SECTION",
+            ):
+                if hasattr(R, nm):
+                    self._text_role_ids.add(int(getattr(R, nm)))
             return True
         except Exception:
             return False
@@ -66,20 +92,46 @@ class A11yTree:
         return self._available
 
     def ensure_enabled(self) -> bool:
-        """Enable org.a11y.Status.IsEnabled on the session bus (without ScreenReaderEnabled)."""
+        """Enable org.a11y.Status.IsEnabled on session DBus; ScreenReaderEnabled stays strictly opt-in."""
         if self._enabled_tried:
             return self._available
         self._enabled_tried = True
+        opt_in_sr = os.environ.get("COMPUTER_USE_ENABLE_SCREENREADER", "0").strip().lower() in ("1", "true", "yes")
         try:
             import dbus
             bus = self._bus or dbus.SessionBus()
             proxy = bus.get_object("org.a11y.Bus", "/org/a11y/bus")
             props = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
-            if not bool(props.Get("org.a11y.Status", "IsEnabled")):
+            cur_en = bool(props.Get("org.a11y.Status", "IsEnabled"))
+            if not cur_en:
+                self._orig_is_enabled = False
                 props.Set("org.a11y.Status", "IsEnabled", dbus.Boolean(True))
+            if opt_in_sr:
+                cur_sr = bool(props.Get("org.a11y.Status", "ScreenReaderEnabled"))
+                if not cur_sr:
+                    self._orig_sr_enabled = False
+                    props.Set("org.a11y.Status", "ScreenReaderEnabled", dbus.Boolean(True))
         except Exception:
             pass
         return self._available
+
+    def close(self) -> None:
+        """Restore any modified org.a11y.Status flags on clean exit."""
+        if self._orig_is_enabled is None and self._orig_sr_enabled is None:
+            return
+        try:
+            import dbus
+            bus = self._bus or dbus.SessionBus()
+            proxy = bus.get_object("org.a11y.Bus", "/org/a11y/bus")
+            props = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+            if self._orig_sr_enabled is not None:
+                props.Set("org.a11y.Status", "ScreenReaderEnabled", dbus.Boolean(self._orig_sr_enabled))
+                self._orig_sr_enabled = None
+            if self._orig_is_enabled is not None:
+                props.Set("org.a11y.Status", "IsEnabled", dbus.Boolean(self._orig_is_enabled))
+                self._orig_is_enabled = None
+        except Exception:
+            pass
 
     def get_ref(self, ref_id: int) -> dict[str, Any] | None:
         return self._ref_map.get(int(ref_id))
@@ -88,7 +140,6 @@ class A11yTree:
         q = query.strip().lower()
         if not q:
             return None
-        # Exact name match first, then substring match
         for el in self._ref_map.values():
             if el.get("name", "").lower() == q:
                 return el
@@ -123,6 +174,30 @@ class A11yTree:
         ok = bool(iface.do_action(chosen))
         return {"ok": ok, "ref": ref_id, "action": chosen_name, "name": meta.get("name", "")}
 
+    @staticmethod
+    def _wayland_coord_offset(
+        root_ext: tuple[int, int, int, int] | None,
+        window_rect: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int]:
+        """Calibrate window-local Wayland AT-SPI2 extents to global compositor coordinates.
+
+        On Wayland (KWin/Sway/Hyprland/Mutter), clients do not know global screen origins, so
+        Atspi.Component.get_extents(CoordType.SCREEN) often returns (0, 0)-relative coordinates
+        even when the window sits at (win_x, win_y). Account for CSD shadow padding as well.
+        """
+        if not os.environ.get("WAYLAND_DISPLAY") or root_ext is None or window_rect is None:
+            return 0, 0
+        rx, ry, rw, rh = root_ext
+        wx, wy, ww, wh = window_rect
+        if (wx == 0 and wy == 0) or (abs(rx - wx) <= 24 and abs(ry - wy) <= 24):
+            return 0, 0
+        # Root starts near window-local (0, 0) while compositor reports a non-zero global window origin
+        if abs(rx) <= 48 and abs(ry) <= 48:
+            pad_x = max(0, (rw - ww) // 2) if (rw > ww and (rw - ww) <= 80) else 0
+            pad_y = max(0, (rh - wh) // 2) if (rh > wh and (rh - wh) <= 80) else 0
+            return (wx - rx - pad_x), (wy - ry - pad_y)
+        return 0, 0
+
     def snapshot(
         self,
         *,
@@ -130,16 +205,26 @@ class A11yTree:
         title_hint: str | None = None,
         pid_hint: int | None = None,
         window_id: str = "",
+        window_rect: tuple[int, int, int, int] | None = None,
         find: str | None = None,
         max_elements: int = 120,
-        budget_ms: int = 320,
+        budget_ms: int = 220,
         diff: str | bool = "auto",
     ) -> dict[str, Any]:
-        """Walk the target window's AT-SPI2 tree and return compact refs + text/diff."""
+        """Walk the target window's AT-SPI2 tree and return calibrated refs + text/diff."""
         t0 = time.perf_counter()
+        win_key = window_id or f"{app_hint or ''}:{title_hint or ''}"
+        if win_key != self._last_window_key:
+            self._key_to_ref.clear()
+            self._ref_map.clear()
+            self._ref_objs.clear()
+            self._last_lines.clear()
+            self._next_ref = 1
+
         if not self._available:
+            self._last_window_key = win_key
             return {
-                "available": False, "window_key": window_id, "elements": [], "text_lines": [],
+                "available": False, "window_key": win_key, "elements": [], "text_lines": [],
                 "formatted": "(AT-SPI2 unavailable)", "is_diff": False, "elapsed_ms": 0.0,
             }
         self.ensure_enabled()
@@ -149,25 +234,28 @@ class A11yTree:
         desktop = Atspi.get_desktop(0)
         root = self._pick_root(desktop, app_hint=app_hint, title_hint=title_hint, pid_hint=pid_hint)
         if root is None:
-            return {
-                "available": True, "window_key": window_id, "elements": [], "text_lines": [],
-                "formatted": "(no AT-SPI2 tree for active window; use visual screenshot / grid)",
-                "is_diff": False, "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
-            }
-
-        win_key = window_id or f"{app_hint or ''}:{title_hint or ''}"
-        if win_key != self._last_window_key:
-            self._key_to_ref.clear()
             self._ref_map.clear()
             self._ref_objs.clear()
             self._last_lines.clear()
-            self._next_ref = 1
+            self._last_window_key = win_key
+            return {
+                "available": True, "window_key": win_key, "elements": [], "text_lines": [],
+                "formatted": "(no AT-SPI2 tree for active window; using visual screenshot + grid)",
+                "is_diff": False, "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+
+        dx, dy = self._wayland_coord_offset(self._bbox(root), window_rect)
 
         elements: list[dict[str, Any]] = []
+        new_ref_map: dict[int, dict[str, Any]] = {}
+        new_ref_objs: dict[int, Any] = {}
+        key_counts: dict[tuple[Any, ...], int] = {}
         text_snippets: list[str] = []
         visited = 0
-        max_nodes = 1400
+        max_nodes = 1400 if find else 1200
         stack: list[tuple[Any, int]] = [(root, 0)]
+        st_visible = Atspi.StateType.VISIBLE
+        st_showing = Atspi.StateType.SHOWING
 
         while stack and visited < max_nodes and time.perf_counter() < deadline:
             node, depth = stack.pop()
@@ -176,20 +264,29 @@ class A11yTree:
             visited += 1
             try:
                 ss = node.get_state_set()
-                if not ss.contains(Atspi.StateType.VISIBLE) or not ss.contains(Atspi.StateType.SHOWING):
+                if not ss.contains(st_visible):
                     continue
-                role = (node.get_role_name() or "").lower()
-                name = (node.get_name() or "").strip()
+                if depth > 0 and not ss.contains(st_showing):
+                    continue
+                role_id = int(node.get_role())
             except Exception:
                 continue
 
-            if role in INTERACTIVE_ROLES:
-                bbox = self._bbox(node)
-                if bbox is not None and bbox[2] > 1 and bbox[3] > 1:
+            if role_id in self._interactive_role_ids:
+                raw_bbox = self._bbox(node)
+                if raw_bbox is not None and raw_bbox[2] > 1 and raw_bbox[3] > 1:
+                    bbox = (raw_bbox[0] + dx, raw_bbox[1] + dy, raw_bbox[2], raw_bbox[3])
+                    try:
+                        role = (node.get_role_name() or "").lower()
+                        name = (node.get_name() or "").strip()
+                    except Exception:
+                        role, name = "control", ""
                     val = self._read_text_or_value(node, role)
                     states = self._read_states(ss)
-                    # Stable key across small pixel shifts (quantize bbox to 8px grid)
-                    skey = (win_key, role, name[:48], bbox[0] // 8, bbox[1] // 8, bbox[2] // 8, bbox[3] // 8)
+                    base_key = (win_key, role, name[:48], bbox[0] // 8, bbox[1] // 8, bbox[2] // 8, bbox[3] // 8)
+                    occ = key_counts.get(base_key, 0)
+                    key_counts[base_key] = occ + 1
+                    skey = (*base_key, occ)
                     ref = self._key_to_ref.get(skey)
                     if ref is None:
                         ref = self._next_ref
@@ -208,16 +305,18 @@ class A11yTree:
                         "center": [cx, cy],
                     }
                     elements.append(item)
-                    self._ref_map[ref] = item
-                    self._ref_objs[ref] = node
-                    if len(elements) >= max_elements * 2:
+                    new_ref_map[ref] = item
+                    new_ref_objs[ref] = node
+                    if not find and len(elements) >= max_elements * 2:
                         break
-            elif role in TEXT_ROLES:
-                txt = name or self._read_text_or_value(node, role)
+            elif role_id in self._text_role_ids and len(text_snippets) < 40:
+                try:
+                    name = (node.get_name() or "").strip()
+                except Exception:
+                    name = ""
+                txt = name or self._read_text_or_value(node, "label")
                 if txt and len(txt) <= 180 and txt not in text_snippets:
                     text_snippets.append(txt)
-                    if len(text_snippets) > 40:
-                        text_snippets = text_snippets[:40]
 
             try:
                 n_children = node.get_child_count()
@@ -230,7 +329,10 @@ class A11yTree:
             except Exception:
                 pass
 
-        # Optional find() filter
+        # Prune dead refs so stale widgets from closed tabs/dialogs never remain clickable
+        self._ref_map = new_ref_map
+        self._ref_objs = new_ref_objs
+
         if find:
             q = find.strip().lower()
             elements = [
@@ -276,6 +378,7 @@ class A11yTree:
             "formatted": formatted,
             "is_diff": is_diff,
             "visited": visited,
+            "coord_offset": [dx, dy],
             "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
         }
 
@@ -312,11 +415,11 @@ class A11yTree:
                     score += 100
                 if is_active:
                     score += 50
-                if title_l and title_l in wname:
+                if title_l and wname and title_l in wname:
                     score += 40
                 elif wname and title_l and wname in title_l:
                     score += 25
-                if app_l and (app_l in aname or aname in app_l):
+                if app_l and aname and (app_l in aname or aname in app_l):
                     score += 30
                 if score > best_score and score > 0:
                     best_score = score

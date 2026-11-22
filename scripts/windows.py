@@ -1,4 +1,4 @@
-"""Ultra-fast Linux window manager bridge (KDE KWin 6 Scripting DBus ~4 ms, Hyprland, Sway, X11)."""
+"""Ultra-fast Linux window manager bridge (KDE KWin 6 Scripting DBus ~1.2 ms, Hyprland, Sway, X11)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -19,9 +20,12 @@ class WindowManager:
     def __init__(self, session_bus=None):
         self._bus = session_bus
         self._seq = 0
+        self._kwin_lock = threading.Lock()
         self._backend = self._detect()
-        self._cached_screen: tuple[int, int] | None = None
-        self._cached_screen_at = 0.0
+        self._cached_bounds: tuple[int, int, int, int] | None = None
+        self._cached_bounds_at = 0.0
+        self._tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        self._spawned: list[subprocess.Popen] = []
 
     def _detect(self) -> str:
         try:
@@ -43,104 +47,234 @@ class WindowManager:
     def backend(self) -> str:
         return self._backend
 
-    def screen_size(self) -> tuple[int, int]:
+    def virtual_bounds(self) -> tuple[int, int, int, int]:
+        """Return (vx, vy, vw, vh) bounding all monitors, supporting negative monitor offsets."""
         now = time.monotonic()
-        if self._cached_screen and (now - self._cached_screen_at) < 5.0:
-            return self._cached_screen
-        size = self._query_screen_size()
-        self._cached_screen = size
-        self._cached_screen_at = now
-        return size
+        if self._cached_bounds and (now - self._cached_bounds_at) < 5.0:
+            return self._cached_bounds
+        bounds = self._query_virtual_bounds()
+        self._cached_bounds = bounds
+        self._cached_bounds_at = now
+        return bounds
 
-    def _query_screen_size(self) -> tuple[int, int]:
+    def screen_size(self) -> tuple[int, int]:
+        _, _, vw, vh = self.virtual_bounds()
+        return vw, vh
+
+    def _query_virtual_bounds(self) -> tuple[int, int, int, int]:
         if self._backend == "kwin-dbus":
             try:
                 data = self._run_kwin_js(
-                    "var g = workspace.virtualScreenSize;"
-                    "return {w: Math.round(g.width), h: Math.round(g.height)};"
+                    """
+                    var sc = workspace.screens || [];
+                    if (sc.length > 0) {
+                        var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+                        for (var i = 0; i < sc.length; i++) {
+                            var g = sc[i].geometry;
+                            if (g.x < minX) minX = g.x;
+                            if (g.y < minY) minY = g.y;
+                            if (g.x + g.width > maxX) maxX = g.x + g.width;
+                            if (g.y + g.height > maxY) maxY = g.y + g.height;
+                        }
+                        if (maxX > minX && maxY > minY) {
+                            return {x: Math.round(minX), y: Math.round(minY), w: Math.round(maxX - minX), h: Math.round(maxY - minY)};
+                        }
+                    }
+                    var vs = workspace.virtualScreenSize;
+                    return {x: 0, y: 0, w: Math.round(vs.width), h: Math.round(vs.height)};
+                    """
                 )
                 if data and data.get("w", 0) > 0 and data.get("h", 0) > 0:
-                    return int(data["w"]), int(data["h"])
+                    return int(data["x"]), int(data["y"]), int(data["w"]), int(data["h"])
+            except Exception:
+                pass
+        if self._backend == "hyprland":
+            try:
+                mons = json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"], text=True, timeout=2))
+                if mons:
+                    xs, ys, x2s, y2s = [], [], [], []
+                    for m in mons:
+                        sc = max(0.5, float(m.get("scale", 1.0)))
+                        mw, mh = m["width"], m["height"]
+                        if int(m.get("transform", 0)) % 2 == 1:
+                            mw, mh = mh, mw
+                        mx, my = int(m["x"]), int(m["y"])
+                        xs.append(mx)
+                        ys.append(my)
+                        x2s.append(mx + int(round(mw / sc)))
+                        y2s.append(my + int(round(mh / sc)))
+                    if xs and max(x2s) > min(xs) and max(y2s) > min(ys):
+                        return min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)
+            except Exception:
+                pass
+        if self._backend == "sway":
+            try:
+                outs = json.loads(subprocess.check_output(["swaymsg", "-t", "get_outputs"], text=True, timeout=2))
+                active_outs = [o for o in outs if o.get("active") and o.get("rect")]
+                if active_outs:
+                    xs = [int(o["rect"]["x"]) for o in active_outs]
+                    ys = [int(o["rect"]["y"]) for o in active_outs]
+                    x2s = [int(o["rect"]["x"]) + int(o["rect"]["width"]) for o in active_outs]
+                    y2s = [int(o["rect"]["y"]) + int(o["rect"]["height"]) for o in active_outs]
+                    return min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)
             except Exception:
                 pass
         if shutil.which("kscreen-doctor"):
             r = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=2)
             if r.returncode == 0:
-                max_x, max_y = 0, 0
-                for m in re.finditer(r"Geometry:\s*(\d+),(\d+)\s+(\d+)x(\d+)", r.stdout):
+                xs, ys, x2s, y2s = [], [], [], []
+                for m in re.finditer(r"Geometry:\s*(-?\d+),(-?\d+)\s+(\d+)x(\d+)", r.stdout):
                     x, y, w, h = map(int, m.groups())
-                    max_x = max(max_x, x + w)
-                    max_y = max(max_y, y + h)
-                if max_x > 0 and max_y > 0:
-                    return max_x, max_y
+                    xs.append(x)
+                    ys.append(y)
+                    x2s.append(x + w)
+                    y2s.append(y + h)
+                if xs:
+                    return min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)
         if shutil.which("xrandr") and os.environ.get("DISPLAY"):
             r = subprocess.run(["xrandr", "--current"], capture_output=True, text=True, timeout=2)
             m = re.search(r"current\s+(\d+)\s+x\s+(\d+)", r.stdout)
             if m:
-                return int(m.group(1)), int(m.group(2))
-        return 1920, 1080
+                return 0, 0, int(m.group(1)), int(m.group(2))
+        return 0, 0, 1920, 1080
 
     def _run_kwin_js(self, body_js: str, timeout_ms: int = 1200) -> Any:
-        """Execute a short KWin 6 script and receive JSON back over DBus in ~4 ms."""
+        """Execute a short KWin 6 script via /dev/shm and receive JSON back over DBus in ~1.2 ms."""
         import dbus
         import dbus.service
         from gi.repository import GLib
 
-        bus = self._bus or dbus.SessionBus()
-        bus_name = bus.get_unique_name()
-        self._seq += 1
-        tag = f"cu_{os.getpid()}_{self._seq}"
-        obj_path = f"/AntigravityCU/{tag}"
-        iface_name = "org.antigravity.ComputerUse"
-        result_box: list[str] = []
-        loop = GLib.MainLoop()
+        with self._kwin_lock:
+            bus = self._bus or dbus.SessionBus()
+            bus_name = bus.get_unique_name()
+            self._seq += 1
+            tag = f"cu_{os.getpid()}_{self._seq}"
+            obj_path = f"/AntigravityCU/{tag}"
+            iface_name = "org.antigravity.ComputerUse"
+            result_box: list[str] = []
+            timed_out = [False]
+            loop = GLib.MainLoop()
 
-        class _Receiver(dbus.service.Object):
-            @dbus.service.method(iface_name, in_signature="s", out_signature="")
-            def Report(self, payload: str) -> None:
-                result_box.append(str(payload))
-                loop.quit()
+            class _Receiver(dbus.service.Object):
+                @dbus.service.method(iface_name, in_signature="s", out_signature="")
+                def Report(self, payload: str) -> None:
+                    result_box.append(str(payload))
+                    if loop.is_running():
+                        loop.quit()
 
-        receiver = _Receiver(bus, obj_path)
-        wrapped = (
-            "(function() {\n"
-            f"  var __res = (function() {{\n{body_js}\n  }})();\n"
-            f'  callDBus("{bus_name}", "{obj_path}", "{iface_name}", "Report", JSON.stringify(__res === undefined ? null : __res));\n'
-            "})();\n"
-        )
-        script_path = ""
-        scripting = dbus.Interface(bus.get_object("org.kde.KWin", "/Scripting"), "org.kde.kwin.Scripting")
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".js", prefix="agcu_", delete=False, encoding="utf-8") as f:
-                f.write(wrapped)
-                script_path = f.name
-            sid = int(scripting.loadScript(script_path, tag, signature="ss"))
-            script_obj = dbus.Interface(bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}"), "org.kde.kwin.Script")
-            script_obj.run()
-            timer_id = GLib.timeout_add(timeout_ms, loop.quit)
-            loop.run()
-            GLib.source_remove(timer_id)
+            def _on_timeout() -> bool:
+                timed_out[0] = True
+                if loop.is_running():
+                    loop.quit()
+                return False
+
+            receiver = _Receiver(bus, obj_path)
+            wrapped = (
+                "(function() {\n"
+                f"  var __res = (function() {{\n{body_js}\n  }})();\n"
+                f'  callDBus("{bus_name}", "{obj_path}", "{iface_name}", "Report", JSON.stringify(__res === undefined ? null : __res));\n'
+                "})();\n"
+            )
+            script_path = ""
+            scripting = dbus.Interface(bus.get_object("org.kde.KWin", "/Scripting"), "org.kde.kwin.Scripting")
+            sid = -1
+            script_obj = None
             try:
-                script_obj.stop()
+                with tempfile.NamedTemporaryFile(
+                    "w", suffix=".js", prefix="agcu_", dir=self._tmp_dir, delete=False, encoding="utf-8"
+                ) as f:
+                    f.write(wrapped)
+                    script_path = f.name
+                sid = int(scripting.loadScript(script_path, tag, signature="ss"))
+                if sid < 0:
+                    raise RuntimeError("KWin loadScript failed")
+                script_obj = dbus.Interface(bus.get_object("org.kde.KWin", f"/Scripting/Script{sid}"), "org.kde.kwin.Script")
+                script_obj.run()
+                if not result_box:
+                    timer_id = GLib.timeout_add(timeout_ms, _on_timeout)
+                    loop.run()
+                    if not timed_out[0]:
+                        GLib.source_remove(timer_id)
+            finally:
+                if script_obj is not None:
+                    try:
+                        script_obj.stop()
+                    except Exception:
+                        pass
+                if sid >= 0:
+                    try:
+                        scripting.unloadScript(tag)
+                    except Exception:
+                        pass
+                receiver.remove_from_connection()
+                if script_path and os.path.exists(script_path):
+                    try:
+                        os.unlink(script_path)
+                    except Exception:
+                        pass
+            if not result_box:
+                raise TimeoutError("KWin scripting callback timed out")
+            return json.loads(result_box[0])
+
+    def cursor_pos(self) -> tuple[int, int]:
+        """Fast single-call query for the current OS cursor position."""
+        if self._backend == "kwin-dbus":
+            try:
+                d = self._run_kwin_js("var c = workspace.cursorPos; return {x: Math.round(c.x), y: Math.round(c.y)};")
+                return int(d["x"]), int(d["y"])
             except Exception:
                 pass
+        elif self._backend == "hyprland":
             try:
-                scripting.unloadScript(tag)
+                raw = subprocess.check_output(["hyprctl", "cursorpos"], text=True, timeout=1.5).strip()
+                if "," in raw:
+                    x, y = raw.split(",", 1)
+                    return int(x.strip()), int(y.strip())
             except Exception:
                 pass
-        finally:
-            receiver.remove_from_connection()
-            if script_path and os.path.exists(script_path):
-                try:
-                    os.unlink(script_path)
-                except Exception:
-                    pass
-        if not result_box:
-            raise TimeoutError("KWin scripting callback timed out")
-        return json.loads(result_box[0])
+        elif self._backend == "x11" and shutil.which("xdotool"):
+            try:
+                r = subprocess.run(["xdotool", "getmouselocation", "--shell"], capture_output=True, text=True, timeout=1.5)
+                cx = cy = 0
+                for line in r.stdout.splitlines():
+                    if line.startswith("X="):
+                        cx = int(line[2:])
+                    elif line.startswith("Y="):
+                        cy = int(line[2:])
+                return cx, cy
+            except Exception:
+                pass
+        st = self.state()
+        return int(st["cursor"]["x"]), int(st["cursor"]["y"])
+
+    def _sway_windows(self) -> list[dict[str, Any]]:
+        tree = json.loads(subprocess.check_output(["swaymsg", "-t", "get_tree"], text=True, timeout=2))
+        wins: list[dict[str, Any]] = []
+
+        def walk(node: dict[str, Any]) -> None:
+            if node.get("type") in ("con", "floating_con") and node.get("pid"):
+                r = node.get("rect") or {}
+                if r.get("width", 0) > 1 and r.get("height", 0) > 1:
+                    app = node.get("app_id") or (node.get("window_properties") or {}).get("class") or "window"
+                    wins.append({
+                        "id": str(node["id"]),
+                        "title": str(node.get("name") or ""),
+                        "app": str(app),
+                        "pid": int(node.get("pid") or 0),
+                        "x": int(r["x"]), "y": int(r["y"]),
+                        "w": int(r["width"]), "h": int(r["height"]),
+                        "active": bool(node.get("focused")),
+                        "minimized": False,
+                        "fullscreen": bool(node.get("fullscreen_mode")),
+                    })
+            for ch in (node.get("nodes") or []) + (node.get("floating_nodes") or []):
+                walk(ch)
+
+        walk(tree)
+        return wins
 
     def state(self) -> dict[str, Any]:
-        """Return {'screen': {w, h}, 'cursor': {x, y}, 'windows': [...], 'active': {...}|None}."""
+        """Return {'screen': {x, y, w, h}, 'cursor': {x, y}, 'windows': [...], 'active': {...}|None}."""
         if self._backend == "kwin-dbus":
             data = self._run_kwin_js(
                 """
@@ -165,18 +299,37 @@ class WindowManager:
                     });
                 }
                 var c = workspace.cursorPos;
-                var vs = workspace.virtualScreenSize;
+                var sc = workspace.screens || [];
+                var minX = 0, minY = 0, sw = 0, sh = 0;
+                if (sc.length > 0) {
+                    minX = 1e9; minY = 1e9; var maxX = -1e9, maxY = -1e9;
+                    for (var j = 0; j < sc.length; j++) {
+                        var sg = sc[j].geometry;
+                        if (sg.x < minX) minX = sg.x;
+                        if (sg.y < minY) minY = sg.y;
+                        if (sg.x + sg.width > maxX) maxX = sg.x + sg.width;
+                        if (sg.y + sg.height > maxY) maxY = sg.y + sg.height;
+                    }
+                    sw = Math.round(maxX - minX);
+                    sh = Math.round(maxY - minY);
+                    minX = Math.round(minX);
+                    minY = Math.round(minY);
+                } else {
+                    var vs = workspace.virtualScreenSize;
+                    sw = Math.round(vs.width);
+                    sh = Math.round(vs.height);
+                }
                 return {
-                    screen: {w: Math.round(vs.width), h: Math.round(vs.height)},
+                    screen: {x: minX, y: minY, w: sw, h: sh},
                     cursor: {x: Math.round(c.x), y: Math.round(c.y)},
                     windows: wins
                 };
                 """
             )
-            self._cached_screen = (int(data["screen"]["w"]), int(data["screen"]["h"]))
-            self._cached_screen_at = time.monotonic()
-            active = next((w for w in data["windows"] if w.get("active")), None)
-            data["active"] = active
+            sc = data["screen"]
+            self._cached_bounds = (int(sc.get("x", 0)), int(sc.get("y", 0)), int(sc["w"]), int(sc["h"]))
+            self._cached_bounds_at = time.monotonic()
+            data["active"] = next((w for w in data["windows"] if w.get("active")), None)
             return data
 
         if self._backend == "hyprland":
@@ -199,18 +352,24 @@ class WindowManager:
                 }
                 for c in clients if c.get("mapped", True)
             ]
-            sw, sh = self.screen_size()
-            return {"screen": {"w": sw, "h": sh}, "cursor": {"x": cx, "y": cy}, "windows": wins,
+            vx, vy, vw, vh = self.virtual_bounds()
+            return {"screen": {"x": vx, "y": vy, "w": vw, "h": vh}, "cursor": {"x": cx, "y": cy}, "windows": wins,
+                    "active": next((w for w in wins if w["active"]), None)}
+
+        if self._backend == "sway":
+            wins = self._sway_windows()
+            vx, vy, vw, vh = self.virtual_bounds()
+            return {"screen": {"x": vx, "y": vy, "w": vw, "h": vh}, "cursor": {"x": 0, "y": 0}, "windows": wins,
                     "active": next((w for w in wins if w["active"]), None)}
 
         if self._backend == "x11":
             return self._x11_state()
 
-        sw, sh = self.screen_size()
-        return {"screen": {"w": sw, "h": sh}, "cursor": {"x": 0, "y": 0}, "windows": [], "active": None}
+        vx, vy, vw, vh = self.virtual_bounds()
+        return {"screen": {"x": vx, "y": vy, "w": vw, "h": vh}, "cursor": {"x": 0, "y": 0}, "windows": [], "active": None}
 
     def _x11_state(self) -> dict[str, Any]:
-        sw, sh = self.screen_size()
+        vx, vy, vw, vh = self.virtual_bounds()
         cx, cy = 0, 0
         active_id = ""
         if shutil.which("xdotool"):
@@ -225,15 +384,16 @@ class WindowManager:
                 active_id = hex(int(r2.stdout.strip()))
         wins: list[dict[str, Any]] = []
         if shutil.which("wmctrl"):
+            # wmctrl -lpGx has 10 columns: WID DESKTOP PID X Y W H WM_CLASS CLIENT_MACHINE TITLE...
             r = subprocess.run(["wmctrl", "-lpGx"], capture_output=True, text=True, timeout=2)
             for line in r.stdout.splitlines():
-                parts = line.split(None, 8)
+                parts = line.split(None, 9)
                 if len(parts) < 9:
                     continue
                 wid = hex(int(parts[0], 16))
                 wins.append({
                     "id": wid,
-                    "title": parts[8],
+                    "title": parts[9] if len(parts) > 9 else "",
                     "app": parts[7],
                     "pid": int(parts[2]),
                     "x": int(parts[3]), "y": int(parts[4]),
@@ -242,7 +402,7 @@ class WindowManager:
                     "minimized": False,
                     "fullscreen": False,
                 })
-        return {"screen": {"w": sw, "h": sh}, "cursor": {"x": cx, "y": cy}, "windows": wins,
+        return {"screen": {"x": vx, "y": vy, "w": vw, "h": vh}, "cursor": {"x": cx, "y": cy}, "windows": wins,
                 "active": next((w for w in wins if w["active"]), None)}
 
     def find_window(
@@ -370,29 +530,50 @@ class WindowManager:
 
         if self._backend == "hyprland":
             if act == "focus":
-                subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{wid}"], check=True, capture_output=True)
+                subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{wid}"], check=True, capture_output=True, timeout=2)
             elif act == "close":
-                subprocess.run(["hyprctl", "dispatch", "closewindow", f"address:{wid}"], check=True, capture_output=True)
+                subprocess.run(["hyprctl", "dispatch", "closewindow", f"address:{wid}"], check=True, capture_output=True, timeout=2)
             else:
-                raise ValueError(f"Action {act!r} not implemented for Hyprland yet")
+                raise ValueError(f"Action {act!r} not supported on Hyprland")
             return {**target, "action": act}
 
-        if self._backend == "x11" and shutil.which("wmctrl"):
+        if self._backend == "sway":
             if act == "focus":
-                subprocess.run(["wmctrl", "-i", "-a", wid], check=True, capture_output=True)
+                subprocess.run(["swaymsg", f"[con_id={wid}] focus"], check=True, capture_output=True, timeout=2)
             elif act == "close":
-                subprocess.run(["wmctrl", "-i", "-c", wid], check=True, capture_output=True)
+                subprocess.run(["swaymsg", f"[con_id={wid}] kill"], check=True, capture_output=True, timeout=2)
             elif act == "maximize":
-                subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"], check=True, capture_output=True)
+                subprocess.run(["swaymsg", f"[con_id={wid}] fullscreen enable"], check=True, capture_output=True, timeout=2)
             elif act == "unmaximize":
-                subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "remove,maximized_vert,maximized_horz"], check=True, capture_output=True)
-            elif act == "move_resize":
-                nx = target["x"] if x is None else int(x)
-                ny = target["y"] if y is None else int(y)
-                nw = target["w"] if w is None else int(w)
-                nh = target["h"] if h is None else int(h)
-                subprocess.run(["wmctrl", "-i", "-r", wid, "-e", f"0,{nx},{ny},{nw},{nh}"], check=True, capture_output=True)
+                subprocess.run(["swaymsg", f"[con_id={wid}] fullscreen disable"], check=True, capture_output=True, timeout=2)
+            elif act == "minimize":
+                subprocess.run(["swaymsg", f"[con_id={wid}] move scratchpad"], check=True, capture_output=True, timeout=2)
+            else:
+                raise ValueError(f"Action {act!r} not supported on Sway")
             return {**target, "action": act}
+
+        if self._backend == "x11":
+            if act == "minimize" and shutil.which("xdotool"):
+                subprocess.run(["xdotool", "windowminimize", str(int(wid, 16))], check=True, capture_output=True, timeout=2)
+                return {**target, "action": act}
+            if shutil.which("wmctrl"):
+                if act == "focus":
+                    subprocess.run(["wmctrl", "-i", "-a", wid], check=True, capture_output=True, timeout=2)
+                elif act == "close":
+                    subprocess.run(["wmctrl", "-i", "-c", wid], check=True, capture_output=True, timeout=2)
+                elif act == "maximize":
+                    subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"], check=True, capture_output=True, timeout=2)
+                elif act == "unmaximize":
+                    subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "remove,maximized_vert,maximized_horz"], check=True, capture_output=True, timeout=2)
+                elif act == "move_resize":
+                    nx = target["x"] if x is None else int(x)
+                    ny = target["y"] if y is None else int(y)
+                    nw = target["w"] if w is None else int(w)
+                    nh = target["h"] if h is None else int(h)
+                    subprocess.run(["wmctrl", "-i", "-r", wid, "-e", f"0,{nx},{ny},{nw},{nh}"], check=True, capture_output=True, timeout=2)
+                else:
+                    raise ValueError(f"Unsupported X11 window action: {action!r}")
+                return {**target, "action": act}
 
         raise RuntimeError(f"Window control unavailable on backend {self._backend!r}")
 
@@ -406,6 +587,8 @@ class WindowManager:
         argv = shlex.split(command) if isinstance(command, str) else [str(a) for a in command]
         if not argv:
             raise ValueError("Empty launch command")
+        # Reap any previously finished child processes so we never leak zombies
+        self._spawned = [p for p in self._spawned if p.poll() is None]
         before_ids = {w["id"] for w in self.state()["windows"]}
         proc = subprocess.Popen(
             argv,
@@ -414,16 +597,18 @@ class WindowManager:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        self._spawned.append(proc)
         appeared = None
         if wait_app is not None or timeout_ms > 0:
             deadline = time.monotonic() + max(0.2, timeout_ms / 1000.0)
             q = (wait_app or os.path.basename(argv[0])).lower()
             while time.monotonic() < deadline:
-                time.sleep(0.08)
+                time.sleep(0.06)
                 for w in self.state()["windows"]:
-                    if w["id"] not in before_ids or (wait_app and q in (w["app"] + " " + w["title"]).lower()):
-                        appeared = w
-                        break
+                    if w["id"] not in before_ids:
+                        if not wait_app or q in (w["app"] + " " + w["title"]).lower():
+                            appeared = w
+                            break
                 if appeared:
                     break
         return {"pid": proc.pid, "command": argv, "window": appeared}

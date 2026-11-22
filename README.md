@@ -1,64 +1,20 @@
 # computer-use
 
-Fast native Linux desktop automation plugin and MCP server for Antigravity, built around direct KWin ScreenShot2 pipe capture, kernel `/dev/uinput` absolute pointer and keyboard input, AT-SPI2 semantic `[ref]` diffs, and Cairo Set-of-Marks and coordinate-grid overlays.
+Fast native desktop automation MCP server and Antigravity plugin for Linux (Wayland and X11) and Windows 10/11: ~5 ms full-screen JPEG capture, smooth custom AI cursor with click ripples, independent user mouse, background mode, and semantic AT-SPI2 / Windows UI Automation `[ref]` trees.
 
-## Measured Latency
+Works with Antigravity, Claude Code, Codex CLI, Cursor, Gemini CLI, and any stdio MCP client.
 
-Measured on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`, scale `1.0`) via `python3 scripts/computer_use_mcp.py --bench` (median of 5 runs):
+## Paste This Into Your Agent
 
-| Operation | Backend | Median | Min |
-| --- | --- | ---: | ---: |
-| Window list + active window + cursor | `org.kde.KWin /Scripting` DBus | 1.68 ms | 1.63 ms |
-| Clipboard read | `org.kde.klipper` DBus | 0.05 ms | 0.03 ms |
-| Full `1920x1080` raw screen capture | `org.kde.KWin.ScreenShot2` Unix FD pipe | 3.80 ms | 3.40 ms |
-| `400x300` region capture | `org.kde.KWin.ScreenShot2` Unix FD pipe | 0.57 ms | 0.22 ms |
-| `1280x720` JPEG encode (`q=75`, ~62 KB) | `GdkPixbuf` | 16.00 ms | 15.59 ms |
-| `1280x720` JPEG + `0..1000` grid + cursor | `GdkPixbuf` + `cairo` | 23.06 ms | 22.93 ms |
-| `1920x1080` frame pixel diff | `numpy` | 1.57 ms | 1.56 ms |
-| Active window AT-SPI2 tree walk | `gi.repository.Atspi` | 4.41 ms | 4.22 ms |
-| Absolute pointer move (`EV_ABS` 0..65535) | Persistent `/dev/uinput` | 0.01 ms | 0.01 ms |
+Copy and paste this into Antigravity, Claude Code, Codex, or Cursor to install and verify automatically:
 
-End-to-end full-screen JPEG capture takes ~20 ms (~27 ms with coordinate grid and cursor overlay), compared to ~150 ms when spawning `spectacle` per screenshot.
-
-## Architecture
-
-Each subsystem uses a direct in-process Linux interface first and falls back automatically on other Wayland compositors or X11:
-
-- `scripts/capture.py`: Direct `org.kde.KWin.ScreenShot2` Unix FD pipe capture (fallbacks: `grim`, `spectacle`, `maim`, `scrot`), bilinear downscale and JPEG/PNG encoding via `GdkPixbuf`, Cairo Set-of-Marks `[ref]` badges and `0..1000` coordinate grids, and NumPy frame diffing (`changed_pct`, `changed_bbox`, `wait_until_settled`, `wait_for_change`).
-- `scripts/uinput_driver.py`: Persistent kernel `/dev/uinput` QEMU usb-tablet style absolute pointer (`0..65535`, keeping the visible desktop cursor intact with pixel-exact placement on Wayland and X11) and virtual keyboard, plus cosine-eased drag and CLI fallbacks (`ydotool`, `xdotool`, `wtype`).
-- `scripts/windows.py`: Direct `org.kde.KWin /Scripting` DBus JSON bridge (fallbacks: `hyprctl`, `swaymsg`, `wmctrl`/`xdotool`) for window listing, focus, minimize, maximize, close, move/resize, and app launching.
-- `scripts/a11y.py`: Bounded AT-SPI2 tree walker (320 ms / 1400-node cap) with stable per-window `[ref]` IDs, `find()`, incremental `AX_DIFF` output, and mouse-free `do_action()`.
-- `scripts/clipboard.py`: Direct `org.kde.klipper` DBus read/write (fallbacks: `wl-clipboard`, `xclip`, `xsel`).
-- `scripts/computer_use_mcp.py`: Serialized JSON-RPC 2.0 stdio MCP server exposing 6 tools, batched step execution, atomic save/paste/restore clipboard typing (auto-switching to `ctrl+shift+v` in terminals), human mouse-takeover detection (`>180 px` jump aborts remaining batch steps), and optional `COMPUTER_USE_AUDIT_LOG` JSONL logging.
-
-## MCP Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `desktop_observe` | 1-call window list + active app AT-SPI2 `[ref]` tree (`AX_DIFF` on repeat calls) + automatic JPEG screenshot with grid when AX has fewer than 5 elements. |
-| `desktop_act` | Execute batched steps (`click`, `move`/`hover`, `drag`, `scroll`, `type`, `key`/`hotkey`, `ax_action`, `focus`, `window`, `launch`, `wait`, `screenshot`) with smart settle, pre/post pixel diff, and takeover safety. |
-| `desktop_screenshot` | Capture `screen`, `active`, `window`, `area`, or `ref` with optional Set-of-Marks `[ref]` badges, `0..1000` coordinate grid, and `diff_from_last`. |
-| `desktop_windows` | List, focus, minimize, maximize, unmaximize, move/resize, close, or launch desktop applications. |
-| `desktop_clipboard` | Read, write, or clear the system clipboard. |
-| `desktop_status` | Report active display server, resolution, detected backends, and `/dev/uinput` write access. |
-
-## Requirements
-
-- Linux (Wayland or X11; fastest on KDE Plasma 6 Wayland)
-- Python 3.10+ with system bindings:
-  - Arch Linux: `sudo pacman -S python-gobject python-cairo python-numpy python-dbus gdk-pixbuf2 at-spi2-core`
-  - Debian / Ubuntu: `sudo apt install python3-gi python3-cairo python3-numpy python3-dbus gir1.2-gdkpixbuf-2.0 gir1.2-atspi-2.0`
-- Writable `/dev/uinput` for direct kernel pointer and keyboard injection:
-
-```bash
-sudo usermod -aG input "$USER"
-echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uinput.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput
+```text
+Install https://github.com/alexander-src/computer-use by following https://raw.githubusercontent.com/alexander-src/computer-use/main/INSTALL.md and verify with --selftest.
 ```
 
-Log out and back in if you were just added to the `input` group.
+## Manual Quick Start
 
-## Install for Antigravity
+Linux (Arch, CachyOS, Ubuntu, Fedora, Wayland or X11):
 
 ```bash
 git clone https://github.com/alexander-src/computer-use.git
@@ -66,27 +22,90 @@ cd computer-use
 ./install.sh
 ```
 
-`install.sh` copies the plugin bundle (`plugin.json`, `mcp_config.json`, `rules/AGENTS.md`, `skills/computer-use/SKILL.md`, `agents/computer-use.md`, `assets/logo.svg`, and `scripts/`) into `~/.gemini/config/plugins/computer-use/`, writes absolute paths to `mcp_config.json`, and runs `--selftest`. Restart Antigravity afterward so it discovers the new plugin directory.
+Windows 10 / 11 (PowerShell, zero external binaries required):
 
-## Standalone CLI Checks and Tests
+```powershell
+git clone https://github.com/alexander-src/computer-use.git
+cd computer-use
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Both installers set up the Antigravity plugin bundle (`~/.gemini/config/plugins/computer-use/`) and run `--selftest`. Restart Antigravity afterward so it loads the new plugin. See [INSTALL.md](INSTALL.md) for Claude Code, Codex CLI, Cursor, and Gemini CLI one-liners.
+
+## Why It Is Fast (Measured Latency)
+
+Measured on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python3 scripts/computer_use_mcp.py --bench` (median of 5 runs):
+
+| Operation | Backend | Median | Min |
+| --- | --- | ---: | ---: |
+| Window list + active window + cursor | `org.kde.KWin /Scripting` DBus | 1.27 ms | 1.23 ms |
+| Clipboard read | `org.kde.klipper` DBus | 0.21 ms | 0.19 ms |
+| Full `1920x1080` raw screen capture | `org.kde.KWin.ScreenShot2` FD pipe | 3.70 ms | 3.28 ms |
+| `400x300` region capture | `org.kde.KWin.ScreenShot2` FD pipe | 0.28 ms | 0.26 ms |
+| `1280x720` JPEG encode (`q=75`) | Cairo bilinear + AVX2 `libturbojpeg` | 1.53 ms | 1.52 ms |
+| `1280x720` JPEG + `0..1000` grid + cursor | Cairo zero-swap RGBX + `libturbojpeg` | 1.69 ms | 1.66 ms |
+| `1920x1080` pixel diff | `numpy` | 1.48 ms | 1.46 ms |
+| Private background capture (`800x600`) | Authenticated `Xvfb` + direct `libX11` | 1.91 ms | 1.85 ms |
+| Absolute pointer move (`EV_ABS` 0..65535) | Persistent `/dev/uinput` | 0.01 ms | 0.01 ms |
+
+Full `1920x1080 -> 1280x720` screenshot capture plus JPEG encoding runs in ~5.2 ms (~5.4 ms with coordinate grid and cursor ring), roughly 28x faster than spawning `spectacle` (~150 ms).
+
+## Independent AI Cursor and Background Mode
+
+### Smooth Custom AI Cursor (Keep Your Own Mouse)
+
+While the agent moves to click a button, a click-through cyan AI pointer glides smoothly along an ease-in-out curve and plays an expanding click ripple (cyan for left click, amber for right click, double pulse for double click) using `zwlr_layer_shell_v1` on Wayland (KDE Plasma 6, Hyprland, Sway, River, COSMIC) or `WS_EX_LAYERED` + `WDA_EXCLUDEFROMCAPTURE` on Windows. Moving your physical mouse never aborts active batches by default; after each click, your physical cursor is restored immediately. Preview it non-destructively with `python3 scripts/computer_use_mcp.py --demo-cursor`.
+
+### Background Computer Use (Linux and Windows)
+
+Pass `background: true` (after `desktop_background`) to automate apps without moving your mouse, stealing focus, or touching your clipboard. On Linux, `desktop_background(action="start")` launches a private `MIT-MAGIC-COOKIE-1` authenticated `Xvfb` virtual display (`XGetImage` + `XTest`) with its own screen buffer and cursor. On Windows, `desktop_background(action="attach", app="...")` captures the target window with `PrintWindow(PW_RENDERFULLCONTENT)` and sends child-HWND `PostMessageW` mouse and keyboard events directly to it while it stays behind your active windows.
+
+## Cross-Platform Architecture
+
+| Subsystem | Linux (Wayland / X11) | Windows 10 / 11 |
+| --- | --- | --- |
+| Screen capture | `KWin.ScreenShot2` FD pipe, `grim`, `maim`, `scrot`, `spectacle` | Per-Monitor DPI v2 `BitBlt`, `PrintWindow` |
+| Image encode & overlays | Cairo + AVX2 `libturbojpeg`, `GdkPixbuf` (`glycin` compatible) | Built-in GDI+ exact-length `IStream`, `turbojpeg.dll`, 5x7 bitmap badges |
+| Pointer & keyboard | Persistent `/dev/uinput` (US/UK layout aware + atomic paste), `ydotool`, `xdotool`, `wtype` | `SendInput` (`MOUSEEVENTF_VIRTUALDESK`, `KEYEVENTF_EXTENDEDKEY`, `KEYEVENTF_UNICODE` UTF-16) |
+| Window management | KWin Scripting DBus, Hyprland, Sway, X11 (`wmctrl`/`xdotool`) | `EnumWindows` (`DWMWA_CLOAKED` filtered), `DWMWA_EXTENDED_FRAME_BOUNDS`, `AttachThreadInput` focus |
+| Accessibility tree | AT-SPI2 (Wayland global-coord calibrated, stable `[ref]` diffs, `Action`) | Native MTA `IUIAutomation` COM (`ControlViewWalker`, `[ref]` diffs, `Invoke`/`Toggle`) |
+| Clipboard | Klipper DBus, `wl-clipboard`, `xclip`, `xsel` | Win32 `CF_UNICODETEXT` with lock retry |
+| Custom AI cursor | Pure-Python Wayland `zwlr_layer_shell_v1` + `wl_shm` + Cairo | Win32 `WS_EX_LAYERED` + `WS_EX_TRANSPARENT` + `WDA_EXCLUDEFROMCAPTURE` |
+| Background mode | Authenticated private `Xvfb` + `libX11`/`libXtst` | `PrintWindow` + child-HWND `PostMessageW` |
+
+## MCP Tools (7)
+
+| Tool | Purpose |
+| --- | --- |
+| `desktop_observe` | 1-call window list + active app AT-SPI2/UIA `[ref]` tree (`AX_DIFF` on repeat calls) + automatic ~5 ms JPEG screenshot with `0..1000` grid when AX has fewer than 5 elements. |
+| `desktop_act` | Execute batched steps (`click`, `move`/`hover`, `drag`, `scroll`, `type`, `key`/`hotkey`, `ax_action`, `focus`, `window`, `launch`, `wait`, `screenshot`) with smooth AI cursor glide, click ripples, smart settle, and pixel diff. Supports `background: true`. |
+| `desktop_background` | Start, attach, launch into, inspect, or stop an isolated background session (`Xvfb` on Linux, `PrintWindow` + `PostMessageW` on Windows). |
+| `desktop_screenshot` | Capture `screen`, `active`, `window`, `area`, `ref`, or `background` with optional Set-of-Marks `[ref]` badges, `0..1000` coordinate grid, and `diff_from_last`. |
+| `desktop_windows` | List, focus, minimize, maximize, unmaximize, move/resize, close, or launch desktop windows. |
+| `desktop_clipboard` | Read, write, or clear the system clipboard. |
+| `desktop_status` | Report OS, active backends, keyboard layout, overlay status, background status, and virtual multi-monitor geometry. |
+
+## Testing and Diagnostics
 
 ```bash
-# Non-destructive protocol and live backend check
+# Non-destructive MCP protocol and live desktop backend check
 python3 scripts/computer_use_mcp.py --selftest
 
 # Live subsystem latency benchmark
 python3 scripts/computer_use_mcp.py --bench
 
-# Unit, mocked engine, Cairo overlay, and stdio JSON-RPC tests
+# Visual non-destructive preview of the smooth cyan AI cursor + click ripples
+python3 scripts/computer_use_mcp.py --demo-cursor
+
+# Full unit, TurboJPEG/Cairo, Xvfb background, Win32/COM, and stdio JSON-RPC suite
 python3 -m unittest discover -s tests -v
 ```
 
-Set `COMPUTER_USE_AUDIT_LOG=/path/to/audit.jsonl` in `mcp_config.json` (or your shell environment) to record tool calls and timings in JSONL format.
+Set `COMPUTER_USE_AUDIT_LOG=/path/to/audit.jsonl` to log every tool call and latency to JSONL. Set `COMPUTER_USE_OVERLAY=0` or `COMPUTER_USE_SMOOTH_CURSOR=0` to disable the custom cursor overlay or smooth glide. Set `COMPUTER_USE_ENABLE_SCREENREADER=1` on Linux only if you want `org.a11y.Status.ScreenReaderEnabled` toggled on for Chromium/Electron AT-SPI2 trees (restored on exit).
 
 ## Limitations
 
-- Linux only (no macOS or Windows backends).
-- Direct `/dev/uinput` keyboard typing assumes a US-QWERTY keymap for short ASCII strings (`<= 24` chars). Longer text, Unicode characters, and non-US symbols automatically use atomic clipboard paste instead; pass `mode: "paste"` on `type` if you use a non-US layout for short ASCII strings as well.
-- Chromium and Electron apps (such as Chrome, Brave, VS Code, or Discord) do not expose full AT-SPI2 trees unless launched with `--force-renderer-accessibility`. `desktop_observe` detects sparse AX trees (`< 5` elements) and automatically falls back to a grid-overlaid JPEG screenshot.
-- Multi-monitor setups with fractional scaling or negative monitor offsets may require verifying cursor mapping against `desktop_windows` and `desktop_screenshot`; single-monitor and side-by-side integer-scale setups map 1:1.
-- Running arbitrary GUI actions on a live session can click real buttons and submit real forms. Keep `detect_takeover: true` enabled so moving your mouse aborts active batches.
+- Supports Linux (Wayland and X11) and Windows 10/11; macOS is not implemented yet.
+- Windows background mode (`PrintWindow` + `PostMessageW`) requires the target window to be unminimized (it can sit behind other windows) because Windows DWM stops rendering minimized windows; some apps that poll raw hardware keyboard state ignore posted modifier hotkeys like `Ctrl+S` in background mode.
+- On Linux Wayland, the click-through AI cursor overlay requires compositor support for `zwlr_layer_shell_v1` (supported on KDE Plasma 6, Hyprland, Sway, River, and COSMIC; GNOME Mutter does not expose `wlr-layer-shell`, so actions still work without the floating cyan cursor).
+- On Windows, clicking inside elevated (Administrator / UAC) windows requires running the MCP server with matching elevation due to Windows UIPI isolation.
