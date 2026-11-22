@@ -435,13 +435,30 @@ class FakeOCR:
         return fast_ocr.match_ocr_phrase(self.scan_frame(frame), query)
 
 
+class MockEncodeCapture(SyntheticCapture):
+    """OS-independent mock capture encoder for DesktopEngine protocol unit tests."""
+
+    def encode(self, frame, *, max_width=1280, fmt="jpeg", quality=75, annotations=None, grid=False, cursor=None):
+        raw = b"\xff\xd8\xff\xe0MOCKJPEG\xff\xd9" if fmt == "jpeg" else b"\x89PNGMOCKIEND"
+        return {
+            "data_b64": base64.b64encode(raw).decode("ascii"),
+            "mime_type": "image/jpeg" if fmt == "jpeg" else "image/png",
+            "bytes": len(raw),
+            "image_w": min(frame.width, max_width),
+            "image_h": frame.height,
+            "capture_ms": frame.capture_ms,
+            "encode_ms": 0.1,
+            "total_ms": frame.capture_ms + 0.1,
+        }
+
+
 class TestEngineAndProtocol(unittest.TestCase):
     def _make_engine(self, *, active_app="kate", elements=None, frames=None, layout="us", ocr=None):
         wm = FakeWindowManager(active_app=active_app)
         clip = FakeClipboard("saved-user-clip")
         inp = FakeInputDriver(layout=layout)
         ax = FakeA11y(elements=elements)
-        cap = SyntheticCapture(frames=frames)
+        cap = MockEncodeCapture(frames=frames)
         ov = FakeOverlay()
         bg = FakeBackground()
         eng = mcp.DesktopEngine(
