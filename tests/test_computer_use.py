@@ -160,6 +160,7 @@ class SyntheticCapture(capture.ScreenCapture):
         self._backend = "synthetic"
         self._last_thumb = None
         self._last_frame_rect = None
+        self._jpeg_needs_rgb = False
         self._frames = list(frames or [self._make_frame(320, 200, (30, 40, 50, 255))])
         self._idx = 0
 

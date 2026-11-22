@@ -48,6 +48,7 @@ class ScreenCapture:
         self._backend = self._detect()
         self._last_thumb: np.ndarray | None = None
         self._last_frame_rect: tuple[int, int, int, int] | None = None
+        self._jpeg_needs_rgb: bool = False
 
     def _detect(self) -> str:
         if self._try_kwin() is not None:
@@ -338,10 +339,9 @@ class ScreenCapture:
         scale_x = out_w / max(1, src_w)
         scale_y = out_h / max(1, src_h)
 
-        # Strip unused alpha channel up front: 25% less memory for scaling and required by glycin's JPEG encoder (Rgb8)
-        rgb = np.ascontiguousarray(frame.rgba[:, :, :3])
+        raw_bytes = frame.rgba.tobytes()
         pb = GdkPixbuf.Pixbuf.new_from_bytes(
-            GLib.Bytes.new(rgb.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, src_w, src_h, src_w * 3
+            GLib.Bytes.new(raw_bytes), GdkPixbuf.Colorspace.RGB, True, 8, src_w, src_h, src_w * 4
         )
         if out_w != src_w or out_h != src_h:
             pb = pb.scale_simple(out_w, out_h, GdkPixbuf.InterpType.BILINEAR)
@@ -361,7 +361,17 @@ class ScreenCapture:
         out_fmt = "png" if fmt.lower() == "png" else "jpeg"
         if out_fmt == "jpeg":
             q = str(max(20, min(95, int(quality))))
-            ok, encoded = pb.save_to_bufferv("jpeg", ["quality"], [q])
+            if self._jpeg_needs_rgb and pb.get_has_alpha():
+                pb = self._strip_alpha(pb)
+            try:
+                ok, encoded = pb.save_to_bufferv("jpeg", ["quality"], [q])
+            except Exception:
+                # Newer glycin GdkPixbuf JPEG loaders require 3-channel Rgb8; strip post-scale once and cache.
+                if not pb.get_has_alpha():
+                    raise
+                self._jpeg_needs_rgb = True
+                pb = self._strip_alpha(pb)
+                ok, encoded = pb.save_to_bufferv("jpeg", ["quality"], [q])
             mime = "image/jpeg"
         else:
             ok, encoded = pb.save_to_bufferv("png", ["compression"], ["3"])
@@ -383,6 +393,17 @@ class ScreenCapture:
             "encode_ms": round(encode_ms, 1),
             "total_ms": round(frame.capture_ms + encode_ms, 1),
         }
+
+    @staticmethod
+    def _strip_alpha(pb):
+        from gi.repository import GdkPixbuf, GLib
+
+        w, h, rs = pb.get_width(), pb.get_height(), pb.get_rowstride()
+        arr = np.frombuffer(pb.get_pixels(), dtype=np.uint8).reshape((h, rs // 4, 4))[:, :w, :3]
+        rgb = np.ascontiguousarray(arr)
+        return GdkPixbuf.Pixbuf.new_from_bytes(
+            GLib.Bytes.new(rgb.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3
+        )
 
     def _overlay_cairo(
         self,
