@@ -83,6 +83,7 @@ $McpConfig = @{
         "computer-use" = @{
             command = $PythonExe
             args = [string[]]@($ServerScript)
+            env = @{ OMP_THREAD_LIMIT = "1" }
         }
     }
 }

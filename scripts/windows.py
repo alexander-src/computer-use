@@ -597,7 +597,8 @@ class WindowManager:
             if existing is not None:
                 try:
                     self.control("focus", window_id=existing["id"])
-                    time.sleep(0.03)
+                    # Minimized windows need a brief compositor unminimize beat before screenshot/OCR
+                    time.sleep(0.12 if existing.get("minimized") else 0.03)
                 except Exception:
                     pass
                 return {"pid": existing.get("pid", 0), "command": argv, "window": existing, "focused_existing": True}

@@ -84,6 +84,7 @@ cfg = {
         "computer-use": {
             "command": py_bin,
             "args": [os.path.join(target, "scripts", "computer_use_mcp.py")],
+            "env": {"OMP_THREAD_LIMIT": "1"},
         }
     }
 }

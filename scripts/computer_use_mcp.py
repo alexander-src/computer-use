@@ -27,6 +27,8 @@ import importlib
 import json
 import math
 import os
+# Must be set BEFORE importing numpy/libgomp/libtesseract to prevent 16-thread OpenMP thrashing across 8 OCR workers (~5x faster OCR)
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 import platform
 import statistics
 import sys
@@ -44,7 +46,7 @@ from cursor_overlay import CursorOverlay
 from fast_ocr import FastOCR, format_ocr_compact
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.5.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -191,6 +193,7 @@ class DesktopEngine:
         self.last_image_rect: tuple[int, int, int, int] | None = None
         self.last_bg_image_rect: tuple[int, int, int, int] | None = None
         self._pre_step_frame: Frame | None = None
+        self._prev_click: tuple[int, int, str] | None = None
         self._ai_cursor_pos: tuple[float, float] | None = None
         self._clip_restore_gen = 0
         self._clip_restore_timer: threading.Timer | None = None
@@ -1099,6 +1102,9 @@ class DesktopEngine:
         aborted_takeover = False
         had_mutation = False
         self._pre_step_frame = None
+        self._prev_click = None
+        last_ok_op = ""
+        last_ok_submitted = False
 
         for idx, raw_step in enumerate(raw_steps):
             if not isinstance(raw_step, dict):
@@ -1153,6 +1159,12 @@ class DesktopEngine:
                     )
                 step_results.append({"step": idx, "op": op, "ok": True, **res})
                 extra_images.extend(imgs)
+                last_ok_op = op
+                last_ok_submitted = bool(raw_step.get("submit"))
+                if op == "click" and isinstance(res.get("pos"), list) and len(res["pos"]) == 2:
+                    self._prev_click = (int(res["pos"][0]), int(res["pos"][1]), str(res.get("button", "left")))
+                elif op != "wait_and_click":
+                    self._prev_click = None
             except Exception as exc:
                 step_results.append({"step": idx, "op": op, "ok": False, "error": str(exc)})
                 if not raw_step.get("continue_on_error"):
@@ -1182,8 +1194,29 @@ class DesktopEngine:
                     except Exception:
                         after_frame = None
                 elif settle_opt == "fast_flip" and had_mutation and self.capture.backend != "unavailable":
-                    # Single 60Hz compositor frame beat (~14 ms) instead of multi-frame settle polling
-                    time.sleep(0.014)
+                    # After wait_and_click or submit=True at end of batch, briefly wait (<=280 ms) for dialog/view swap
+                    # so post-action OCR sees the NEW screen instead of the closing modal!
+                    if (last_ok_op == "wait_and_click" or last_ok_submitted) and self._pre_step_frame is not None:
+                        base_f = self._pre_step_frame
+                        t_end = time.monotonic() + 0.28
+                        while time.monotonic() < t_end:
+                            time.sleep(0.022)
+                            try:
+                                cur_f = self.capture.capture(
+                                    scope="area",
+                                    area=(base_f.origin_x, base_f.origin_y, base_f.logical_width, base_f.logical_height),
+                                    include_cursor=False,
+                                )
+                                if cur_f.width == base_f.width and cur_f.height == base_f.height:
+                                    d = self.capture.diff_frames(base_f, cur_f, ignore_rects=self._overlay_ignore_rects())
+                                    if d["changed_pct"] >= 1.2:
+                                        after_frame = cur_f
+                                        break
+                            except Exception:
+                                break
+                    else:
+                        # Single 60Hz compositor frame beat (~14 ms) instead of multi-frame settle polling
+                        time.sleep(0.014)
                 elif isinstance(settle_opt, (int, float)) and settle_opt > 0:
                     time.sleep(min(5.0, float(settle_opt) / 1000.0))
 
@@ -1509,6 +1542,8 @@ class DesktopEngine:
             found: tuple[int, int, str] | None = None
             pre_frame = self._pre_step_frame
             last_cur_frame: Frame | None = None
+            retried_prev = False
+            retry_prev_ok = bool(step.get("retry_prev", True))
 
             while True:
                 # Fast path 1: AX cache/tree (instant on native apps)
@@ -1556,6 +1591,20 @@ class DesktopEngine:
                                     break
                         elif (time.monotonic() - t_start) < 0.14:
                             # Screen hasn't painted the post-click transition yet; skip full-window OCR for 20 ms
+                            waiting_for_paint = True
+                        elif (
+                            retry_prev_ok
+                            and not retried_prev
+                            and self._prev_click is not None
+                            and (time.monotonic() - t_start) >= 0.42
+                        ):
+                            # Preceding click was likely swallowed by a closing modal animation; retry it ONCE!
+                            rx, ry, rbtn = self._prev_click
+                            retried_prev = True
+                            self._exec_step(
+                                "click", {"op": "click", "x": rx, "y": ry, "button": rbtn}, active_win,
+                                smooth=False, independent_cursor=independent_cursor, _depth=_depth + 1,
+                            )
                             waiting_for_paint = True
                     # Full active-window fallback if popup didn't match or text was already visible
                     if not waiting_for_paint and (not used_crop or (time.monotonic() - t_start) > 0.14):
@@ -1881,6 +1930,22 @@ class DesktopEngine:
                         return {"found": True, "window": w}, extra_images, active_win
                     time.sleep(0.05)
                 return {"found": False, "app": q}, extra_images, active_win
+            if step.get("gone"):
+                q = str(step["gone"])
+                raw_area = step.get("area")
+                area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+                t_start = time.monotonic()
+                deadline = t_start + timeout_ms / 1000.0
+                while time.monotonic() < deadline:
+                    hit = self._find_text_point(q, active_win, area=area, allow_ocr=bool(step.get("ocr", True)))
+                    if hit is None:
+                        return {
+                            "gone": True,
+                            "text": q,
+                            "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
+                        }, extra_images, active_win
+                    time.sleep(0.03)
+                return {"gone": False, "text": q}, extra_images, active_win
             if step.get("text"):
                 q = str(step["text"])
                 raw_area = step.get("area")
@@ -2197,6 +2262,8 @@ class MCPServer:
         mtimes = self._script_mtimes() if hot_reload else {}
         active_srv: MCPServer = self
         active_srv.engine.ocr.prewarm()
+        if hasattr(active_srv.engine.input, "prewarm"):
+            active_srv.engine.input.prewarm()
         try:
             for line in sys.stdin:
                 line = line.strip()
@@ -2216,6 +2283,8 @@ class MCPServer:
                     active_srv, mtimes = active_srv._maybe_hot_reload(mtimes)
                     if active_srv is not prev_srv:
                         active_srv.engine.ocr.prewarm()
+                        if hasattr(active_srv.engine.input, "prewarm"):
+                            active_srv.engine.input.prewarm()
                 resp = active_srv.handle_request(req)
                 if resp is not None:
                     sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")

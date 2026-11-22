@@ -21,6 +21,7 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 from typing import Callable
 
@@ -358,7 +359,14 @@ class InputDriver:
         self._last_pos: tuple[int, int] | None = None
         self._last_abs: tuple[int, int] = (0, 0)
         self._layout: str = detect_keyboard_layout()
+        self._uinput_lock = threading.Lock()
         atexit.register(self.close)
+
+    def prewarm(self) -> None:
+        """Open /dev/uinput virtual devices asynchronously at server startup to skip the 200 ms first-call settle."""
+        if fcntl is None or not os.access("/dev/uinput", os.W_OK):
+            return
+        threading.Thread(target=self._ensure_uinput, daemon=True, name="agcu-uinput-prewarm").start()
 
     @property
     def layout(self) -> str:
@@ -390,8 +398,14 @@ class InputDriver:
             return False
         if self._ptr_fd is not None and self._kbd_fd is not None:
             return True
-        if self._uinput_error is not None:
-            return False
+        with self._uinput_lock:
+            if self._ptr_fd is not None and self._kbd_fd is not None:
+                return True
+            if self._uinput_error is not None:
+                return False
+            return self._open_uinput_locked()
+
+    def _open_uinput_locked(self) -> bool:
         ptr_fd = -1
         kbd_fd = -1
         try:

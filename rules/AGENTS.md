@@ -11,7 +11,7 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
   - Compound ops (collapse multi-dialog flows into 1 tool call):
     - `launch`: `{command, wait_app?, timeout_ms?}` (focuses an already-open matching window in ~1.5 ms, or launches and waits for the matching window automatically)
     - `open_url`: `{url, app?, new_tab?: false, submit?: true}` (focuses/launches browser, sends `ctrl+l`/`cmd+l` or `ctrl+t`/`cmd+t`, pastes URL, presses Enter)
-    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 25, area?, offset_x?, offset_y?, button?, count?, double?, clear?, type_text?, submit?}` (diffs against the pre-click frame, OCRs only the changed modal in ~22 ms, and clicks as soon as text appears, then optionally clears/types/submits)
+    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 25, area?, offset_x?, offset_y?, retry_prev?: true, button?, count?, double?, clear?, type_text?, submit?}` (diffs against the pre-click frame, OCRs only the changed modal in ~22 ms, auto-retries a swallowed preceding click once after 420 ms if nothing changed, and clicks as soon as text appears)
     - `click_and_type`: `{ref|target|text_target|x,y|nx,ny, offset_x?, offset_y?, text|value, clear?: false, submit?: false, mode?: "auto"|"paste"|"keys"}`
     - `keys`: `{sequence: ["ctrl+t", "tab", "enter"], delay_ms?: 10}` (rapid keyboard macro burst)
     - `repeat`: `{count: 5, steps: [...], delay_ms?: 8}` (local loop, zero extra LLM turns)
@@ -25,7 +25,7 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
     - `ax_action`: `{ref, action_name?}` (mouse-free AT-SPI2 / Windows UIA / macOS `AXPress`)
     - `focus`: `{window_id?|app?|title?}`
     - `window`: `{window_action: "focus"|"minimize"|"maximize"|"unmaximize"|"close"|"move_resize", window_id?|app?|title?, x?, y?, w?, h?}`
-    - `wait`: `{ms?|change?: true, area?, threshold_pct?, text?|app?, timeout_ms?}` (polls AX + local OCR when `text` is set; exits immediately on pixel change when `change: true`)
+    - `wait`: `{ms?|change?: true, area?, threshold_pct?, text?|gone?|app?, timeout_ms?}` (polls AX + local OCR for `text` to appear or `gone` to disappear, or exits immediately on pixel `change`)
     - `screenshot`: `{scope?, area?, ref?, annotate?, grid?, max_width?, quality?}`
 - `desktop_observe` (1-call state: windows + AX `[ref]` tree + automatic inline `OCR_TEXT` `[x,y]` labels on sparse-AX apps with zero image offload; falls back to compact `896px` JPEG only if OCR finds <5 words or `mode: "vision"` / `screenshot: true` is passed):
   - `{mode?: "hybrid"|"ax"|"ocr"|"vision"|"windows", background?: false, ocr?: false, find?, diff?: "auto"|true|false, screenshot?: "auto"|true|false, scope?: "screen"|"active", annotate?, grid?, max_elements?, max_width?: 896, quality?: 62}`
@@ -41,7 +41,7 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
 
 - Do NOT spawn a subagent for 1 to 4 step desktop tasks; subagent startup adds 4 to 5 seconds of overhead. Execute directly via `call_mcp_tool` in 1 to 2 batched `desktop_act` calls. Only delegate long 6+ turn loops, using `invoke_subagent({TypeName: "self", Model: "flash", ...})`.
 - Act first without a wasted initial screenshot whenever you already know the app, shortcut, URL, or button text. Chain the full flow in ONE `desktop_act` call (`launch` + `wait_and_click` + `click_and_type` + `keys` + `repeat`).
-- Never insert blind 400 to 1000 ms `wait` sleeps between clicks. Use `wait_and_click(text=...)` for labeled modals or `wait(change=true, timeout_ms=800)` for icon-driven transitions.
+- Never insert blind 400 to 1000 ms `wait` sleeps between clicks or after submitting a modal. Use `wait_and_click(text=...)` for opening dialogs, `wait(gone="Dialog Title", timeout_ms=2000)` so execution resumes the exact millisecond a submitted dialog closes, or `wait(change=true, timeout_ms=800)` for icon-driven transitions.
 - Avoid unnecessary `read_file` turns: `desktop_observe()` and `desktop_act(observe="auto")` return inline `[x,y]` `OCR_TEXT` labels on sparse-AX apps automatically AND save a ready-to-read `SCREENSHOT_PATH` grid JPEG in 1 ms. Use `OCR_TEXT` directly whenever labels exist; if you genuinely need a textless icon (such as a `+` symbol), call `read_file` directly on the reported `SCREENSHOT_PATH` instead of spending an extra `observe: "vision"` call.
 - Pass `observe: "none"` on intermediate bursts where no visual/OCR feedback is needed.
 - For purely in-browser web tasks in Brave, prefer `brave-browser_brave-browser` (CDP DOM/AX access). Use `computer-use` for native desktop apps, OS dialogs, window management, file pickers, IDEs, media tools, Windows/macOS apps, and background GUI workflows.

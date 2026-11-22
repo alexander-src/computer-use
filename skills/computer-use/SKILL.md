@@ -18,7 +18,7 @@ Control Linux, Windows, and macOS desktops with minimal LLM round-trips via MCP 
      - `click_and_type`: `{op: "click_and_type", target: "SERVER NAME", offset_y: 28, text: "My Server", clear: true, submit: true}`
      - `keys`: `{op: "keys", sequence: ["ctrl+a", "ctrl+c", "alt+tab", "ctrl+v"], delay_ms: 10}`
      - `repeat`: `{op: "repeat", count: 5, steps: [{op: "key", keys: "down"}]}`
-   - Never insert blind 400 to 1000 ms sleeps between steps. Use `wait_and_click(text=...)` for text modals or `wait(change=true, timeout_ms=800)` so execution resumes the millisecond pixels change.
+   - Never insert blind 400 to 1000 ms sleeps between steps. Use `wait_and_click(text=...)` for opening modals (auto-retries a swallowed preceding click once), `wait(gone="Create Channel", timeout_ms=2000)` to resume the millisecond a submitted dialog closes, or `wait(change=true, timeout_ms=800)` for visual transitions.
 
 2. Avoid wasted double-turn screenshot reads (`desktop_observe` and `observe: "auto"`):
    - On sparse-AX apps (Discord, Brave, Chrome, Electron, VS Code, Spotify, Telegram), `desktop_observe()` and `desktop_act(observe="auto")` run pre-warmed 8-thread `tessdata_fast` local OCR and return inline `[x,y] "Label"` coordinates plus a ready `SCREENSHOT_PATH` grid JPEG (1 ms save, zero image offload).

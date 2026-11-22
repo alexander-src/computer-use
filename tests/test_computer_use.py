@@ -743,6 +743,15 @@ class TestEngineAndProtocol(unittest.TestCase):
         self.assertEqual(len(obs_v), 2)
         self.assertEqual(obs_v[1]["type"], "image")
 
+        # Verify wait(gone=...) exits immediately once text disappears from OCR
+        gone_ocr = FakeOCR(responses=[[{"text": "Create", "x": 100, "y": 100, "w": 50, "h": 18, "conf": 95.0}], []])
+        eng3, *_ = self._make_engine(elements=[], ocr=gone_ocr)
+        gone_res = eng3.tool_act({
+            "observe": "none",
+            "steps": [{"op": "wait", "gone": "Create", "timeout_ms": 1000}],
+        })
+        self.assertIn('"gone":true', gone_res[0]["text"])
+
         # Verify script mtime tracker works cleanly for in-process hot-reload
         mtimes = mcp.MCPServer._script_mtimes()
         self.assertIn("computer_use_mcp.py", mtimes)
