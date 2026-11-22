@@ -1,8 +1,8 @@
 {
   "name": "computer-use",
   "displayName": "Computer Use",
-  "version": "2.3.0",
-  "description": "Fast native Linux (Wayland/X11), Windows 10/11, and macOS desktop automation over MCP: 4.5 ms capture+JPEG, non-blocking 120Hz cyan AI cursor, independent user mouse, 8-thread local OCR with inline [x,y] labels, compound ops (open_url, wait_and_click, click_and_type, keys, repeat), background mode, and AT-SPI2/UIA/AXUIElement [ref] diffs.",
+  "version": "2.4.0",
+  "description": "Fast native Linux (Wayland/X11), Windows 10/11, and macOS desktop automation over MCP: 4.5 ms capture+JPEG, non-blocking 120Hz cyan AI cursor, independent user mouse, pre-warmed tessdata_fast local OCR with mixed dark/light normalization and ~22 ms popup crop matching, compound ops, background mode, and AT-SPI2/UIA/AXUIElement [ref] diffs.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Observe my current desktop windows and active app elements",

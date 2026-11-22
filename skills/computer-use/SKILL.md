@@ -14,15 +14,15 @@ Control Linux, Windows, and macOS desktops with minimal LLM round-trips via MCP 
    - Use compound ops so polling, typing, and clicking execute locally instead of waiting for cloud LLM turns:
      - `launch`: `{op: "launch", command: "discord"}` (focuses an existing matching window in ~1.5 ms, or launches and waits for the matching window)
      - `open_url`: `{op: "open_url", app: "brave", url: "https://...", new_tab: true}`
-     - `wait_and_click`: `{op: "wait_and_click", text: "Create My Own", timeout_ms: 2500, type_text?: "...", submit?: true}`
-     - `click_and_type`: `{op: "click_and_type", target: "Server Name", text: "My Server", clear: true, submit: true}`
+     - `wait_and_click`: `{op: "wait_and_click", text: "Create My Own", timeout_ms: 2500, offset_x?: 0, offset_y?: 0, type_text?: "...", submit?: true}` (diffs against the pre-click frame and OCRs only the newly opened modal in ~22 ms, handling both dark apps and white dialogs cleanly)
+     - `click_and_type`: `{op: "click_and_type", target: "SERVER NAME", offset_y: 28, text: "My Server", clear: true, submit: true}`
      - `keys`: `{op: "keys", sequence: ["ctrl+a", "ctrl+c", "alt+tab", "ctrl+v"], delay_ms: 10}`
      - `repeat`: `{op: "repeat", count: 5, steps: [{op: "key", keys: "down"}]}`
    - Never insert blind 400 to 1000 ms sleeps between steps. Use `wait_and_click(text=...)` for text modals or `wait(change=true, timeout_ms=800)` so execution resumes the millisecond pixels change.
 
 2. Avoid wasted double-turn screenshot reads (`desktop_observe` and `observe: "auto"`):
-   - On sparse-AX apps (Discord, Brave, Chrome, Electron, VS Code, Spotify, Telegram), `desktop_observe()` and `desktop_act(observe="auto")` automatically run 8-thread local OCR (~40-82 ms) and return inline `[x,y] "Label"` coordinates directly in the text response without offloading an image to disk.
-   - Only pass `mode: "vision"` or `screenshot: true` when you need to find a textless icon (such as a `+` symbol) or inspect graphics.
+   - On sparse-AX apps (Discord, Brave, Chrome, Electron, VS Code, Spotify, Telegram), `desktop_observe()` and `desktop_act(observe="auto")` run pre-warmed 8-thread `tessdata_fast` local OCR and return inline `[x,y] "Label"` coordinates plus a ready `SCREENSHOT_PATH` grid JPEG (1 ms save, zero image offload).
+   - Use `OCR_TEXT` directly whenever labels exist; if you need a textless icon (such as a `+` button), call `read_file` directly on `SCREENSHOT_PATH` with the reported `coord_scope` instead of burning another `observe: "vision"` turn.
    - Pass `observe: "none"` on predictable intermediate bursts (`0.05 ms` overhead).
 
 3. Independent 120Hz AI cursor and background mode:

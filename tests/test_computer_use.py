@@ -726,11 +726,18 @@ class TestEngineAndProtocol(unittest.TestCase):
         eng2, *_ = self._make_engine(elements=[], ocr=rich_ocr)
         obs_h = eng2.tool_observe({"mode": "hybrid"})
         self.assertEqual(len(obs_h), 1)
-        self.assertIn("OCR_INLINE", obs_h[0]["text"])
+        self.assertIn("SCREENSHOT_PATH:", obs_h[0]["text"])
         self.assertIn("Create My Own Server", obs_h[0]["text"])
         act_a = eng2.tool_act({"steps": [{"op": "wait", "ms": 0}], "observe": "auto"})
         self.assertEqual(len(act_a), 1)
-        self.assertIn("OCR_INLINE", act_a[0]["text"])
+        self.assertIn("SCREENSHOT_PATH:", act_a[0]["text"])
+        # Verify offset_x / offset_y shifts text click coordinates cleanly (e.g. input box 28px below label)
+        eng2_blocks = eng2.tool_act({
+            "observe": "none",
+            "steps": [{"op": "click", "text": "Cancel", "offset_x": 15, "offset_y": 28, "smooth": False}],
+        })
+        self.assertIn("1/1 ok", eng2_blocks[0]["text"])
+        self.assertIn("[141,237]", eng2_blocks[0]["text"])
         # Explicit screenshot=True still attaches the JPEG image!
         obs_v = eng2.tool_observe({"mode": "hybrid", "screenshot": True})
         self.assertEqual(len(obs_v), 2)
@@ -758,34 +765,57 @@ class TestEngineAndProtocol(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux") and fast_ocr.FastOCR().available, "Requires Linux with Cairo + libtesseract")
     def test_live_libtesseract_ocr_on_cairo_dark_ui(self):
         import cairo
-        w, h = 420, 140
+        # Regression test for real Discord layout: dark app background + white modal + blurple button!
+        w, h = 760, 420
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
         ctx = cairo.Context(surf)
-        # Dark-mode background (tests automatic luminance inversion!)
-        ctx.set_source_rgb(0.11, 0.12, 0.15)
+        # Dark Discord background (#1e1f22)
+        ctx.set_source_rgb(0.118, 0.122, 0.133)
         ctx.paint()
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(24.0)
-        ctx.set_source_rgb(0.95, 0.96, 0.98)
-        ctx.move_to(40, 58)
-        ctx.show_text("Save Settings")
-        ctx.move_to(40, 112)
-        ctx.show_text("Cancel")
+        ctx.set_font_size(20.0)
+        ctx.set_source_rgb(0.92, 0.93, 0.96)
+        ctx.move_to(24, 60)
+        ctx.show_text("Sidebar Settings")
+        # Bright WHITE modal dialog (#ffffff) in the center (must NOT be inverted to black!)
+        ctx.set_source_rgb(1.0, 1.0, 1.0)
+        ctx.rectangle(240, 60, 380, 300)
+        ctx.fill()
+        ctx.set_source_rgb(0.08, 0.09, 0.11)
+        ctx.set_font_size(22.0)
+        ctx.move_to(280, 145)
+        ctx.show_text("Create My Own")
+        ctx.move_to(280, 210)
+        ctx.show_text("For me and my friends")
+        # Blurple button (#5865f2) with white text inside the white modal!
+        ctx.set_source_rgb(0.345, 0.396, 0.949)
+        ctx.rectangle(460, 285, 130, 46)
+        ctx.fill()
+        ctx.set_source_rgb(1.0, 1.0, 1.0)
+        ctx.move_to(488, 315)
+        ctx.show_text("Create")
         surf.flush()
         bgra = np.frombuffer(surf.get_data(), dtype=np.uint8).reshape((h, w, 4))
         rgba = bgra[:, :, [2, 1, 0, 3]].copy()
         frame = capture.Frame(rgba=rgba, origin_x=200, origin_y=100, width=w, height=h, scale=1.0, backend="synthetic", capture_ms=0.1)
 
-        ocr = fast_ocr.FastOCR(workers=2)
+        ocr = fast_ocr.FastOCR(workers=4)
         try:
-            hit = ocr.find_text(frame, "Save Settings")
-            self.assertIsNotNone(hit, "Expected live libtesseract to detect dark-mode 'Save Settings'")
-            cx, cy = hit["center"]
-            self.assertTrue(240 <= cx <= 420, f"Unexpected cx={cx}")
-            self.assertTrue(130 <= cy <= 170, f"Unexpected cy={cy}")
+            # Dark sidebar text
+            hit_dark = ocr.find_text(frame, "Sidebar Settings")
+            self.assertIsNotNone(hit_dark, "Failed to detect light text on dark sidebar")
+            # White modal text over dark background
+            hit_modal = ocr.find_text(frame, "Create My Own")
+            self.assertIsNotNone(hit_modal, "Failed to detect dark text inside white modal over dark app!")
+            self.assertTrue(440 <= hit_modal["center"][0] <= 760, f"Unexpected modal cx={hit_modal['center']}")
+            self.assertTrue(210 <= hit_modal["center"][1] <= 270, f"Unexpected modal cy={hit_modal['center']}")
+            # Blurple button inside white modal (isolated button beats "Create" inside "Create My Own")
+            hit_btn = ocr.find_text(frame, "Create")
+            self.assertIsNotNone(hit_btn, "Failed to detect white text on blurple Create button inside white modal!")
+            self.assertTrue(640 <= hit_btn["center"][0] <= 790, f"Expected isolated Create button, got {hit_btn}")
             # Second call hits frame fingerprint cache in <2 ms
             t0 = time.perf_counter()
-            hit2 = ocr.find_text(frame, "Cancel")
+            hit2 = ocr.find_text(frame, "For me and my friends")
             self.assertIsNotNone(hit2)
             self.assertLess((time.perf_counter() - t0) * 1000.0, 5.0)
         finally:

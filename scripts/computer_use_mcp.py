@@ -22,6 +22,7 @@ Highlights:
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib
 import json
 import math
@@ -29,6 +30,7 @@ import os
 import platform
 import statistics
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -42,7 +44,7 @@ from cursor_overlay import CursorOverlay
 from fast_ocr import FastOCR, format_ocr_compact
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.3.0"
+SERVER_VERSION = "2.4.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -188,6 +190,7 @@ class DesktopEngine:
         self.ocr = ocr if ocr is not None else FastOCR()
         self.last_image_rect: tuple[int, int, int, int] | None = None
         self.last_bg_image_rect: tuple[int, int, int, int] | None = None
+        self._pre_step_frame: Frame | None = None
         self._ai_cursor_pos: tuple[float, float] | None = None
         self._clip_restore_gen = 0
         self._clip_restore_timer: threading.Timer | None = None
@@ -451,33 +454,43 @@ class DesktopEngine:
             if el is None:
                 raise ValueError(f"Unknown or stale ref [{rid}]. Call desktop_observe first.")
             cx, cy = el["center"]
-            return int(cx), int(cy)
+            ox = int(step.get("offset_x", 0)) if prefix == "" else 0
+            oy = int(step.get("offset_y", 0)) if prefix == "" else 0
+            return (int(cx) + ox, int(cy) + oy) if background else self._clamp_screen(int(cx) + ox, int(cy) + oy)
 
         if step.get(x_k) is not None and step.get(y_k) is not None:
-            px, py = int(round(float(step[x_k]))), int(round(float(step[y_k])))
+            ox = int(step.get("offset_x", 0)) if prefix == "" else 0
+            oy = int(step.get("offset_y", 0)) if prefix == "" else 0
+            px, py = int(round(float(step[x_k]))) + ox, int(round(float(step[y_k]))) + oy
             return (px, py) if background else self._clamp_screen(px, py)
 
         if step.get(nx_k) is not None and step.get(ny_k) is not None:
             rect = self._scope_rect(str(step.get("coord_scope") or "screen"), active_win, background=background)
+            ox = int(step.get("offset_x", 0)) if prefix == "" else 0
+            oy = int(step.get("offset_y", 0)) if prefix == "" else 0
             px, py = normalized_to_screen(float(step[nx_k]), float(step[ny_k]), rect)
-            return (px, py) if background else self._clamp_screen(px, py)
+            return (px + ox, py + oy) if background else self._clamp_screen(px + ox, py + oy)
 
         raw_area = step.get("area")
         step_area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
         allow_ocr = bool(step.get("ocr", True))
+        ox = int(step.get("offset_x", 0)) if prefix == "" else 0
+        oy = int(step.get("offset_y", 0)) if prefix == "" else 0
 
         if step.get(text_k) and step.get("op") not in ("type", "click_and_type"):
             q = str(step[text_k])
             found = self._find_text_point(q, active_win, area=step_area, allow_ocr=allow_ocr, background=background)
             if found is None:
                 raise ValueError(f"No AX or OCR element matched text {q!r}. Use desktop_observe or coordinates.")
-            return found[0], found[1]
+            px, py = found[0] + ox, found[1] + oy
+            return (px, py) if background else self._clamp_screen(px, py)
         if step.get("text_target"):
             q = str(step["text_target"])
             found = self._find_text_point(q, active_win, area=step_area, allow_ocr=allow_ocr, background=background)
             if found is None:
                 raise ValueError(f"No AX or OCR element matched text_target {q!r}.")
-            return found[0], found[1]
+            px, py = found[0] + ox, found[1] + oy
+            return (px, py) if background else self._clamp_screen(px, py)
 
         if required:
             raise ValueError(f"Missing target: provide {ref_k}, {x_k}/{y_k}, {nx_k}/{ny_k}, or text")
@@ -599,6 +612,57 @@ class DesktopEngine:
         }
         meta = {k: v for k, v in enc.items() if k != "data_b64"}
         return img_block, meta
+
+    @staticmethod
+    def _crop_frame_logical(frame: Frame, bbox: tuple[int, int, int, int], pad: int = 32) -> Frame:
+        bx, by, bw, bh = bbox
+        sc = frame.scale if frame.scale > 0 else 1.0
+        x0 = _clamp(int((bx - frame.origin_x - pad) * sc), 0, frame.width - 1)
+        y0 = _clamp(int((by - frame.origin_y - pad) * sc), 0, frame.height - 1)
+        x1 = _clamp(int((bx - frame.origin_x + bw + pad) * sc), x0 + 1, frame.width)
+        y1 = _clamp(int((by - frame.origin_y + bh + pad) * sc), y0 + 1, frame.height)
+        sub_rgba = frame.rgba[y0:y1, x0:x1, :].copy()
+        return Frame(
+            rgba=sub_rgba,
+            origin_x=frame.origin_x + int(round(x0 / sc)),
+            origin_y=frame.origin_y + int(round(y0 / sc)),
+            width=x1 - x0,
+            height=y1 - y0,
+            scale=frame.scale,
+            backend=frame.backend,
+            capture_ms=frame.capture_ms,
+        )
+
+    def _save_quick_screenshot(
+        self,
+        frame: Frame,
+        *,
+        cursor_pos: tuple[int, int] | None,
+        max_width: int = 896,
+        quality: int = 62,
+    ) -> tuple[str, str] | None:
+        """Save a ~1 ms grid JPEG to a private temp file so icon lookups skip an extra observe='vision' turn."""
+        try:
+            enc = self.capture.encode(
+                frame, max_width=max_width, fmt="jpeg", quality=quality, grid=True, cursor=cursor_pos,
+            )
+            raw = base64.b64decode(enc["data_b64"])
+            uid_tag = str(os.getuid()) if hasattr(os, "getuid") else "user"
+            dst = os.path.join(tempfile.gettempdir(), f"computer-use-last-{uid_tag}.jpg")
+            tmp = f"{dst}.{os.getpid()}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(tmp, flags, 0o600)
+            try:
+                os.write(fd, raw)
+            finally:
+                os.close(fd)
+            os.replace(tmp, dst)
+            self.last_image_rect = (frame.origin_x, frame.origin_y, frame.logical_width, frame.logical_height)
+            vx, vy, vw, vh = self._virtual_bounds()
+            is_full = (frame.origin_x == vx and frame.origin_y == vy and frame.logical_width == vw and frame.logical_height == vh)
+            return dst, ("screen" if is_full else "last_image")
+        except Exception:
+            return None
 
     # -----------------------------------------------------------------------
     # Tool implementations
@@ -946,7 +1010,14 @@ class DesktopEngine:
             lines.append(format_ocr_compact(words))
             if auto_ocr and explicit_ss is None:
                 if ocr_word_count >= 5:
-                    lines.append("OCR_INLINE: exact [x,y] labels above (pass mode='vision' or screenshot=true only for textless icons).")
+                    saved = self._save_quick_screenshot(frame, cursor_pos=cursor_pos, max_width=max_width, quality=quality)
+                    if saved is not None:
+                        lines.append(
+                            f"SCREENSHOT_PATH: {saved[0]} (grid 0..1000, coord_scope={saved[1]!r}; "
+                            f"ONLY read_file if you need a textless icon not in OCR_TEXT)"
+                        )
+                    else:
+                        lines.append("OCR_INLINE: exact [x,y] labels above (pass mode='vision' or screenshot=true only for textless icons).")
                 else:
                     # Pure icon/canvas screen (<5 OCR words): fall back to grid screenshot automatically
                     want_ss = True
@@ -1027,6 +1098,7 @@ class DesktopEngine:
         extra_images: list[dict[str, Any]] = []
         aborted_takeover = False
         had_mutation = False
+        self._pre_step_frame = None
 
         for idx, raw_step in enumerate(raw_steps):
             if not isinstance(raw_step, dict):
@@ -1048,6 +1120,28 @@ class DesktopEngine:
             op = (raw_step.get("op") or raw_step.get("action") or "").lower()
             if op not in ("wait", "screenshot"):
                 had_mutation = True
+            # If next step is wait_and_click / wait(text=...), snapshot baseline before this click/key (~3 ms)
+            # so wait_and_click can diff & OCR ONLY the newly opened modal/menu (~22 ms instead of full window!)
+            if (
+                not bg
+                and op in ("click", "key", "hotkey", "press", "type", "click_and_type", "ax_action")
+                and idx + 1 < len(raw_steps)
+                and isinstance(raw_steps[idx + 1], dict)
+                and self.capture.backend != "unavailable"
+            ):
+                nxt_op = str(raw_steps[idx + 1].get("op") or raw_steps[idx + 1].get("action") or "").lower()
+                if nxt_op == "wait_and_click" or (nxt_op == "wait" and raw_steps[idx + 1].get("text")):
+                    try:
+                        if active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
+                            self._pre_step_frame = self.capture.capture(
+                                scope="area",
+                                area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
+                                include_cursor=False,
+                            )
+                        else:
+                            self._pre_step_frame = self.capture.capture(scope="screen", include_cursor=False)
+                    except Exception:
+                        self._pre_step_frame = None
             try:
                 if bg:
                     res, imgs = self._exec_bg_step(op, raw_step)
@@ -1179,7 +1273,15 @@ class DesktopEngine:
             lines.append(format_ocr_compact(words))
             if observe_opt == "auto":
                 if len(words) >= 5:
-                    lines.append("OCR_INLINE: exact [x,y] labels above (pass observe='vision' or screenshot=true only for textless icons).")
+                    cursor_pos = (int(st_after["cursor"]["x"]), int(st_after["cursor"]["y"]))
+                    saved = self._save_quick_screenshot(obs_frame, cursor_pos=cursor_pos, max_width=max_width, quality=quality)
+                    if saved is not None:
+                        lines.append(
+                            f"SCREENSHOT_PATH: {saved[0]} (grid 0..1000, coord_scope={saved[1]!r}; "
+                            f"ONLY read_file if you need a textless icon not in OCR_TEXT)"
+                        )
+                    else:
+                        lines.append("OCR_INLINE: exact [x,y] labels above (pass observe='vision' or screenshot=true only for textless icons).")
                 else:
                     want_img = True
 
@@ -1396,23 +1498,92 @@ class DesktopEngine:
             if not q:
                 raise ValueError("wait_and_click requires 'text'")
             timeout_ms = max(50, min(15000, int(step.get("timeout_ms", 2500))))
-            poll_s = max(0.02, min(0.5, float(step.get("poll_ms", 45)) / 1000.0))
+            poll_s = max(0.018, min(0.5, float(step.get("poll_ms", 25)) / 1000.0))
             raw_area = step.get("area")
             area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+            allow_ocr = bool(step.get("ocr", True))
+            ox = int(step.get("offset_x", 0))
+            oy = int(step.get("offset_y", 0))
             t_start = time.monotonic()
             deadline = t_start + timeout_ms / 1000.0
             found: tuple[int, int, str] | None = None
+            pre_frame = self._pre_step_frame
+            last_cur_frame: Frame | None = None
+
             while True:
-                found = self._find_text_point(q, active_win, area=area, allow_ocr=bool(step.get("ocr", True)))
-                if found is not None or time.monotonic() >= deadline:
+                # Fast path 1: AX cache/tree (instant on native apps)
+                found = self._find_text_point(q, active_win, area=area, allow_ocr=False)
+                if found is not None:
+                    break
+                # Fast path 2: diff against pre-click frame -> OCR ONLY the newly opened popup/modal (~22 ms!)
+                if allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
+                    if area is not None:
+                        cur_frame = self.capture.capture(scope="area", area=area, include_cursor=False)
+                    elif pre_frame is not None:
+                        cur_frame = self.capture.capture(
+                            scope="area",
+                            area=(pre_frame.origin_x, pre_frame.origin_y, pre_frame.logical_width, pre_frame.logical_height),
+                            include_cursor=False,
+                        )
+                    elif active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
+                        cur_frame = self.capture.capture(
+                            scope="area",
+                            area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
+                            include_cursor=False,
+                        )
+                    else:
+                        cur_frame = self.capture.capture(scope="screen", include_cursor=False)
+                    last_cur_frame = cur_frame
+
+                    used_crop = False
+                    waiting_for_paint = False
+                    if (
+                        pre_frame is not None
+                        and area is None
+                        and cur_frame.width == pre_frame.width
+                        and cur_frame.height == pre_frame.height
+                    ):
+                        d = self.capture.diff_frames(pre_frame, cur_frame, ignore_rects=self._overlay_ignore_rects())
+                        bbox = d.get("changed_bbox")
+                        if d["changed_pct"] >= 0.18 and bbox:
+                            bw, bh = bbox[2], bbox[3]
+                            if (bw * bh) < (cur_frame.logical_width * cur_frame.logical_height * 0.72):
+                                crop = self._crop_frame_logical(cur_frame, bbox, pad=36)
+                                hit = self.ocr.find_text(crop, q)
+                                used_crop = True
+                                if hit is not None:
+                                    found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-popup({hit['match_type']})")
+                                    break
+                        elif (time.monotonic() - t_start) < 0.14:
+                            # Screen hasn't painted the post-click transition yet; skip full-window OCR for 20 ms
+                            waiting_for_paint = True
+                    # Full active-window fallback if popup didn't match or text was already visible
+                    if not waiting_for_paint and (not used_crop or (time.monotonic() - t_start) > 0.14):
+                        hit = self.ocr.find_text(cur_frame, q)
+                        if hit is not None:
+                            found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})")
+                            break
+                if time.monotonic() >= deadline:
                     break
                 time.sleep(poll_s)
+
+            if found is None:
+                # Final full-screen fallback in case a dialog opened outside active_win bounds
+                if allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
+                    full_f = self.capture.capture(scope="screen", include_cursor=False)
+                    hit = self.ocr.find_text(full_f, q)
+                    if hit is not None:
+                        found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-screen({hit['match_type']})")
             if found is None:
                 raise TimeoutError(f"wait_and_click timed out after {timeout_ms}ms waiting for {q!r}")
-            px, py, src = found
+
+            # Store frame right before clicking so the NEXT chained wait_and_click diffs against this modal!
+            self._pre_step_frame = last_cur_frame
+            px, py = self._clamp_screen(found[0] + ox, found[1] + oy)
+            src = found[2]
             click_step = {
                 k: v for k, v in step.items()
-                if k not in ("text", "target", "text_target", "type_text", "value", "clear", "submit")
+                if k not in ("text", "target", "text_target", "type_text", "value", "clear", "submit", "offset_x", "offset_y")
             }
             click_step.update({"op": "click", "x": px, "y": py})
             click_res, c_imgs, active_win = self._exec_step(
@@ -2025,6 +2196,7 @@ class MCPServer:
         hot_reload = os.environ.get("COMPUTER_USE_HOT_RELOAD", "1").strip().lower() not in ("0", "false", "off")
         mtimes = self._script_mtimes() if hot_reload else {}
         active_srv: MCPServer = self
+        active_srv.engine.ocr.prewarm()
         try:
             for line in sys.stdin:
                 line = line.strip()
@@ -2040,7 +2212,10 @@ class MCPServer:
                     sys.stdout.flush()
                     continue
                 if hot_reload and isinstance(req, dict) and req.get("method") in ("tools/call", "tools/list"):
+                    prev_srv = active_srv
                     active_srv, mtimes = active_srv._maybe_hot_reload(mtimes)
+                    if active_srv is not prev_srv:
+                        active_srv.engine.ocr.prewarm()
                 resp = active_srv.handle_request(req)
                 if resp is not None:
                     sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\n")

@@ -86,6 +86,11 @@ def match_ocr_phrase(
                 },
             )
 
+    def _is_isolated(ln: list[dict[str, Any]], start: int, end: int) -> bool:
+        left_ok = (start == 0) or (ln[start]["x"] - (ln[start - 1]["x"] + ln[start - 1]["w"]) > 32)
+        right_ok = (end >= len(ln)) or (ln[end]["x"] - (ln[end - 1]["x"] + ln[end - 1]["w"]) > 32)
+        return left_ok and right_ok
+
     n_qt = len(q_tokens)
     for ln in lines:
         norm_ln = [_normalize_token(m["text"]) for m in ln]
@@ -94,12 +99,13 @@ def match_ocr_phrase(
         if n_qt == 1:
             qt = q_tokens[0]
             for i in range(n):
+                iso_bonus = 5.0 if _is_isolated(ln, i, i + 1) else 0.0
                 if raw_ln[i] == q_raw or norm_ln[i] == qt:
-                    consider(100.0, [ln[i]], "exact")
+                    consider(100.0 + iso_bonus, [ln[i]], "exact")
                 elif qt and qt in norm_ln[i]:
                     # Prefer tighter matches over huge unrelated words
                     ratio = len(qt) / max(1, len(norm_ln[i]))
-                    consider(60.0 + ratio * 25.0, [ln[i]], "substring")
+                    consider(60.0 + ratio * 25.0 + iso_bonus * 0.5, [ln[i]], "substring")
         else:
             # Exact / near-contiguous phrase match along a visual line
             for i in range(0, n - n_qt + 1):
@@ -114,10 +120,11 @@ def match_ocr_phrase(
                 if too_far:
                     continue
                 wn = norm_ln[i:i + n_qt]
+                iso_bonus = 5.0 if _is_isolated(ln, i, i + n_qt) else 0.0
                 if wn == q_tokens:
-                    consider(110.0, window, "phrase_exact")
+                    consider(110.0 + iso_bonus, window, "phrase_exact")
                 elif all(q_tokens[j] in wn[j] for j in range(n_qt)):
-                    consider(80.0, window, "phrase_sub")
+                    consider(80.0 + iso_bonus * 0.5, window, "phrase_sub")
 
     return best[1] if best else None
 
@@ -216,6 +223,26 @@ class FastOCR:
                 continue
         return None
 
+    def _find_tessdata_dir(self) -> bytes | None:
+        """Prefer fast 4MB tessdata_fast eng.traineddata (~5x faster than 23MB distro tessdata_best)."""
+        plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cands = [
+            os.environ.get("COMPUTER_USE_TESSDATA_DIR", "").strip(),
+            os.path.join(plugin_root, "assets", "tessdata"),
+            os.path.expanduser("~/.cache/computer-use/tessdata"),
+        ]
+        for d in cands:
+            if d and os.path.isfile(os.path.join(d, "eng.traineddata")):
+                return d.encode("utf-8")
+        return None
+
+    def prewarm(self) -> None:
+        """Lazily initialize Tesseract handles on a background daemon thread so first OCR has 0 ms cold init."""
+        if self._init_done:
+            return
+        t = threading.Thread(target=self._ensure_init, daemon=True, name="agcu-ocr-prewarm")
+        t.start()
+
     def _ensure_init(self) -> bool:
         if self._init_done:
             return self._available
@@ -251,12 +278,15 @@ class FastOCR:
                 lib.TessBaseAPIDelete.argtypes = [ctypes.c_void_p]
                 lib.TessBaseAPIDelete.restype = None
 
+                tessdata_dir = self._find_tessdata_dir()
                 apis: list[int] = []
                 for _ in range(self._workers):
                     a = lib.TessBaseAPICreate()
                     if not a:
                         continue
-                    rc = int(lib.TessBaseAPIInit3(a, None, b"eng"))
+                    rc = int(lib.TessBaseAPIInit3(a, tessdata_dir, b"eng"))
+                    if rc != 0 and tessdata_dir is not None:
+                        rc = int(lib.TessBaseAPIInit3(a, None, b"eng"))
                     if rc != 0:
                         lib.TessBaseAPIDelete(a)
                         continue
@@ -268,6 +298,7 @@ class FastOCR:
                     return False
                 self._lib = lib
                 self._apis = apis
+                self._tessdata_fast = tessdata_dir is not None
                 self._pool = ThreadPoolExecutor(max_workers=len(apis), thread_name_prefix="agcu-ocr")
                 self._available = True
                 return True
@@ -302,6 +333,33 @@ class FastOCR:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _normalize_dark_light_gray(gray: np.ndarray) -> np.ndarray:
+        """Smooth O(1) local-background polarity normalizer (~3 ms).
+
+        Handles dark apps, bright white modals over dark apps, and colored buttons (blurple/green/red
+        with white text) inside white modals simultaneously without creating dark tile borders.
+        """
+        h, w = gray.shape
+        if h < 32 or w < 32:
+            return np.ascontiguousarray(255 - gray) if float(gray.mean()) < 128.0 else gray
+        g_f = gray.astype(np.float32)
+        half = g_f[::2, ::2]
+        r = min(6, max(2, min(half.shape[0], half.shape[1]) // 4))
+        p = np.pad(half, ((r, r), (r, r)), mode="edge")
+        cs = np.cumsum(p, axis=0)
+        z0 = np.zeros((1, p.shape[1]), dtype=np.float32)
+        v = (cs[2 * r:, :] - np.vstack([z0, cs[:-2 * r - 1, :]])) / float(2 * r + 1)
+        cs2 = np.cumsum(v, axis=1)
+        z1 = np.zeros((v.shape[0], 1), dtype=np.float32)
+        bg_h = (cs2[:, 2 * r:] - np.hstack([z1, cs2[:, :-2 * r - 1]])) / float(2 * r + 1)
+        bg = np.repeat(np.repeat(bg_h, 2, axis=0), 2, axis=1)[:h, :w]
+        dark = (bg < 150.0) | ((g_f >= 75.0) & (g_f < 175.0) & (bg < 220.0))
+        if not dark.any():
+            return gray
+        inv_boost = np.clip(255.0 - np.maximum(0.0, g_f - bg) * (255.0 / np.maximum(64.0, 255.0 - bg)), 0.0, 255.0)
+        return np.ascontiguousarray(np.where(dark, inv_boost, g_f).astype(np.uint8))
+
     def scan_frame(self, frame, *, min_conf: float = 35.0) -> list[dict[str, Any]]:
         """Extract all UI word boxes from a Frame in screen logical coordinates (cached per unchanged frame)."""
         if not self._ensure_init():
@@ -319,19 +377,17 @@ class FastOCR:
         if fp == self._cache_fp and rect_sig == self._cache_rect:
             return self._cache_words
 
-        # Green channel is an accurate ~0.1ms luminance proxy; auto-invert dark-theme UIs for Tesseract
-        gray = np.ascontiguousarray(rgba[:, :, 1])
-        if float(gray[::4, ::4].mean()) < 120.0:
-            gray = np.ascontiguousarray(255 - gray)
+        # Green channel is an accurate ~0.1 ms luminance proxy; locally normalize dark + white regions
+        gray = self._normalize_dark_light_gray(np.ascontiguousarray(rgba[:, :, 1]))
 
-        n_workers = min(len(self._apis), max(1, h // 90))
+        n_workers = min(len(self._apis), max(1, h // 48))
         lib = self._lib
         apis = self._apis
         sc = frame.scale if frame.scale > 0 else 1.0
         ox, oy = frame.origin_x, frame.origin_y
 
         def run_strip(idx: int) -> list[dict[str, Any]]:
-            overlap = 12
+            overlap = 24
             y0 = max(0, (idx * h) // n_workers - (overlap if idx > 0 else 0))
             y1 = min(h, ((idx + 1) * h) // n_workers + (overlap if idx < n_workers - 1 else 0))
             if y1 - y0 < 6:

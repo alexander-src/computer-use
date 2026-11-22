@@ -34,10 +34,10 @@ Both installers set up the Antigravity plugin bundle (`~/.gemini/config/plugins/
 
 ## Reducing Both Local Overhead and LLM Round-Trips
 
-End-to-end speed in a desktop agent depends mostly on how many cloud LLM turns a task takes, not just raw millisecond timings. `computer-use` v2.3 cuts both:
+End-to-end speed in a desktop agent depends mostly on how many cloud LLM turns a task takes, not just raw millisecond timings. `computer-use` v2.4 cuts both:
 
-- Inline local OCR replaces double-turn image offloads: on apps with empty accessibility trees (Discord, Brave, Chrome, Electron, VS Code, Spotify), `desktop_observe()` and `desktop_act(observe="auto")` run 8-thread in-process `libtesseract` (~40 to 82 ms) and return clickable `[x,y] "Label"` coordinates inline in the text response. Hosts that offload MCP images to disk no longer force an extra `read_file` round-trip on every dialog step (pass `mode: "vision"` or `screenshot: true` only for textless icons).
-- Closed-loop compound ops collapse multi-dialog flows into one call: `launch` (focuses an already-open window in ~1.5 ms or waits for the matching window), `open_url`, `wait_and_click` (polls AX + local OCR every 45 ms), `click_and_type`, `keys`, `repeat`, and `wait(change=true)` eliminate blind 500 ms sleeps and per-click cloud turns.
+- Inline pre-warmed `tessdata_fast` OCR replaces double-turn image offloads: on apps with empty accessibility trees (Discord, Brave, Chrome, Electron, VS Code, Spotify), `desktop_observe()` and `desktop_act(observe="auto")` run 8-thread in-process `libtesseract` with 24x24 local dark/light tile normalization (reading dark sidebars, white modals, and colored buttons on the same screen) and return clickable `[x,y] "Label"` coordinates inline plus a 1 ms `SCREENSHOT_PATH` grid JPEG for textless icons.
+- Popup-cropped closed-loop compound ops collapse multi-dialog flows into one call: `launch` (focuses an already-open window in ~1.5 ms or waits for the matching window), `open_url`, `wait_and_click` (diffs against the pre-click frame and OCRs only the newly opened modal in ~20 to 32 ms, with optional `offset_x`/`offset_y`), `click_and_type`, `keys`, `repeat`, and `wait(change=true)` eliminate blind 500 ms sleeps and per-click cloud turns.
 - Non-blocking cursor glide and zero-waste defaults: the cyan AI cursor animates at 120Hz on a background thread (`0.008 ms` on the action path), and `desktop_act(observe="none")` skips redundant window and frame queries.
 
 Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python3 scripts/computer_use_mcp.py --bench` and tool profiling:
@@ -50,7 +50,8 @@ Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python
 | `desktop_observe(mode="hybrid")` (visual) | KWin DBus + sparse AX cache + `896px` grid | 8.45 ms | 47 KB base64 payload |
 | `400x300` region capture | `org.kde.KWin.ScreenShot2` FD pipe | 0.25 ms | Sub-millisecond crop |
 | Full `1920x1080` capture + `896px` JPEG (`q=62`) | `KWin.ScreenShot2` + Cairo + AVX2 `libturbojpeg` | 4.54 ms | 41 KB (50 KB with grid) |
-| Full-screen `1920x1080` local OCR scan | 8-thread in-process `ctypes` `libtesseract` | 82.0 ms | 0.00 ms on cached frame, 0 image offload |
+| Modal popup `450x550` local OCR (`wait_and_click`) | Pre-warmed 8-thread `tessdata_fast` + diff crop | 21 to 32 ms | Mixed dark/light tile normalization |
+| Dense `1493x888` app window local OCR (326 words) | Pre-warmed 8-thread `tessdata_fast` | 122.7 ms | Down from 790 ms on distro `tessdata_best` |
 | Window list + active window + cursor | `org.kde.KWin /Scripting` DBus | 1.23 ms | 1.15 ms min |
 | Clipboard read | `org.kde.klipper` DBus | 0.03 ms | Async restore saves ~110 ms/paste |
 | Private background capture (`800x600`) | Authenticated `Xvfb` + direct `libX11` | 1.91 ms | Zero interference with live session |

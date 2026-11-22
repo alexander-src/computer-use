@@ -64,6 +64,18 @@ if [[ "$REPO_REAL" != "$TARGET_REAL" ]]; then
 fi
 chmod +x "$TARGET_DIR/scripts/computer_use_mcp.py"
 
+# Install 4 MB tessdata_fast eng.traineddata (~5x faster local OCR than 23 MB distro tessdata_best)
+TESS_DST="$TARGET_DIR/assets/tessdata/eng.traineddata"
+if [[ ! -f "$TESS_DST" ]]; then
+  mkdir -p "$TARGET_DIR/assets/tessdata"
+  if [[ -f "$REPO_DIR/assets/tessdata/eng.traineddata" ]]; then
+    cp -f "$REPO_DIR/assets/tessdata/eng.traineddata" "$TESS_DST"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 8 "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata" -o "$TESS_DST.tmp" 2>/dev/null \
+      && mv -f "$TESS_DST.tmp" "$TESS_DST" || rm -f "$TESS_DST.tmp"
+  fi
+fi
+
 "$PYTHON_BIN" - "$PYTHON_BIN" "$TARGET_DIR" <<'PY'
 import json, os, sys
 py_bin, target = sys.argv[1], sys.argv[2]

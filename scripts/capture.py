@@ -255,6 +255,7 @@ def _draw_cairo_overlays(
         if 0 <= cx <= w and 0 <= cy <= h:
             ctx.set_line_width(2.0)
             set_rgba(0.14, 0.75, 0.98, 0.95)
+            ctx.new_sub_path()
             ctx.arc(cx, cy, 8.0, 0, 6.283185)
             ctx.stroke()
 

@@ -7,16 +7,16 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
 - `desktop_act` (batched local execution, 0.05 ms with `observe: "none"`, non-blocking 120Hz cyan AI cursor + ripples, preserves user physical mouse):
   - `{steps: [{op, ...}, ...], background?: false, fast?: false, smooth?: true, independent_cursor?: true, settle?: "none"|"smart"|ms, observe?: "auto"|"ax"|"ocr"|"vision"|"crop_changed"|"none", verify_change?: false, detect_takeover?: false, screenshot?, annotate?, grid?, max_width?: 896, quality?: 62}` (or single-step shorthand `{op: "click", text: "Save"}`).
   - Moving the user's mouse never aborts by default. The AI glides its own cyan overlay cursor asynchronously at 120Hz (zero sleep on the action path) and restores the user's physical cursor immediately after clicking.
-  - Text targets (`text`, `text_target`, `target`) resolve locally via AX/UIA/AXUIElement first, then 8-thread in-process parallel OCR (`libtesseract`, ~40-82 ms) on Chromium/Electron/Discord/VS Code/games with zero cloud screenshots.
+  - Text targets (`text`, `text_target`, `target`) resolve locally via AX/UIA/AXUIElement first, then pre-warmed 8-thread `tessdata_fast` OCR with local dark/light tile normalization (reads both dark apps and white modals on the same screen) and ~22 ms popup-diff cropping inside `wait_and_click`. Pass `offset_x` / `offset_y` to click an input box below a label (e.g. `offset_y: 28`) or an icon beside a header (e.g. `offset_x: 110`).
   - Compound ops (collapse multi-dialog flows into 1 tool call):
     - `launch`: `{command, wait_app?, timeout_ms?}` (focuses an already-open matching window in ~1.5 ms, or launches and waits for the matching window automatically)
     - `open_url`: `{url, app?, new_tab?: false, submit?: true}` (focuses/launches browser, sends `ctrl+l`/`cmd+l` or `ctrl+t`/`cmd+t`, pastes URL, presses Enter)
-    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 45, area?, button?, count?, double?, clear?, type_text?, submit?}` (polls AX + local OCR every 45 ms and clicks as soon as text appears, then optionally clears/types/submits)
-    - `click_and_type`: `{ref|target|text_target|x,y|nx,ny, text|value, clear?: false, submit?: false, mode?: "auto"|"paste"|"keys"}`
+    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 25, area?, offset_x?, offset_y?, button?, count?, double?, clear?, type_text?, submit?}` (diffs against the pre-click frame, OCRs only the changed modal in ~22 ms, and clicks as soon as text appears, then optionally clears/types/submits)
+    - `click_and_type`: `{ref|target|text_target|x,y|nx,ny, offset_x?, offset_y?, text|value, clear?: false, submit?: false, mode?: "auto"|"paste"|"keys"}`
     - `keys`: `{sequence: ["ctrl+t", "tab", "enter"], delay_ms?: 10}` (rapid keyboard macro burst)
     - `repeat`: `{count: 5, steps: [...], delay_ms?: 8}` (local loop, zero extra LLM turns)
   - Core ops:
-    - `click`: `{ref|text|x,y|nx,ny, coord_scope?, button?: "left"|"right"|"middle", count?: 1|2|3, double?, modifiers?: ["ctrl","shift","alt","super","cmd"]}`
+    - `click`: `{ref|text|x,y|nx,ny, offset_x?, offset_y?, coord_scope?, button?: "left"|"right"|"middle", count?: 1|2|3, double?, modifiers?: ["ctrl","shift","alt","super","cmd"]}`
     - `move` / `hover`: `{ref|text|x,y|nx,ny, coord_scope?}`
     - `drag`: `{from_ref|from_x,from_y|from_nx,from_ny, to_ref|to_x,to_y|to_nx,to_ny, coord_scope?, button?, duration_ms?, steps?}`
     - `scroll`: `{direction?: "down"|"up"|"left"|"right", clicks?: 5, ref|text|x,y|nx,ny, coord_scope?}`
@@ -42,6 +42,6 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
 - Do NOT spawn a subagent for 1 to 4 step desktop tasks; subagent startup adds 4 to 5 seconds of overhead. Execute directly via `call_mcp_tool` in 1 to 2 batched `desktop_act` calls. Only delegate long 6+ turn loops, using `invoke_subagent({TypeName: "self", Model: "flash", ...})`.
 - Act first without a wasted initial screenshot whenever you already know the app, shortcut, URL, or button text. Chain the full flow in ONE `desktop_act` call (`launch` + `wait_and_click` + `click_and_type` + `keys` + `repeat`).
 - Never insert blind 400 to 1000 ms `wait` sleeps between clicks. Use `wait_and_click(text=...)` for labeled modals or `wait(change=true, timeout_ms=800)` for icon-driven transitions.
-- Avoid unnecessary `read_file` turns on offloaded screenshots: `desktop_observe()` and `desktop_act(observe="auto")` return inline `[x,y]` `OCR_TEXT` labels on sparse-AX apps automatically. Only pass `mode: "vision"` or `screenshot: true` when you genuinely need to locate a textless icon.
+- Avoid unnecessary `read_file` turns: `desktop_observe()` and `desktop_act(observe="auto")` return inline `[x,y]` `OCR_TEXT` labels on sparse-AX apps automatically AND save a ready-to-read `SCREENSHOT_PATH` grid JPEG in 1 ms. Use `OCR_TEXT` directly whenever labels exist; if you genuinely need a textless icon (such as a `+` symbol), call `read_file` directly on the reported `SCREENSHOT_PATH` instead of spending an extra `observe: "vision"` call.
 - Pass `observe: "none"` on intermediate bursts where no visual/OCR feedback is needed.
 - For purely in-browser web tasks in Brave, prefer `brave-browser_brave-browser` (CDP DOM/AX access). Use `computer-use` for native desktop apps, OS dialogs, window management, file pickers, IDEs, media tools, Windows/macOS apps, and background GUI workflows.
