@@ -925,6 +925,11 @@ class TestEngineAndProtocol(unittest.TestCase):
         ctx.set_source_rgb(0.92, 0.93, 0.96)
         ctx.move_to(24, 60)
         ctx.show_text("Sidebar Settings")
+        # Dim Discord-style placeholder text (#6d6f78 on #1e1f22)
+        ctx.set_font_size(15.0)
+        ctx.set_source_rgb(0x6d / 255.0, 0x6f / 255.0, 0x78 / 255.0)
+        ctx.move_to(24, 115)
+        ctx.show_text("Search permissions")
         # Bright WHITE modal dialog (#ffffff) in the center (must NOT be inverted to black!)
         ctx.set_source_rgb(1.0, 1.0, 1.0)
         ctx.rectangle(240, 60, 380, 300)
@@ -949,9 +954,11 @@ class TestEngineAndProtocol(unittest.TestCase):
 
         ocr = fast_ocr.FastOCR(workers=4)
         try:
-            # Dark sidebar text
+            # Dark sidebar text + dim placeholder text (#6d6f78 on #1e1f22)
             hit_dark = ocr.find_text(frame, "Sidebar Settings")
             self.assertIsNotNone(hit_dark, "Failed to detect light text on dark sidebar")
+            hit_dim = ocr.find_text(frame, "Search permissions")
+            self.assertIsNotNone(hit_dim, "Failed to detect dim placeholder text on dark background")
             # White modal text over dark background
             hit_modal = ocr.find_text(frame, "Create My Own")
             self.assertIsNotNone(hit_modal, "Failed to detect dark text inside white modal over dark app!")

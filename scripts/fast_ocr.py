@@ -513,10 +513,11 @@ class FastOCR:
                         continue
                     lib.TessBaseAPISetPageSegMode(a, 11)  # PSM_SPARSE_TEXT (ideal for UI labels & buttons)
                     lib.TessBaseAPISetVariable(a, b"tessedit_do_invert", b"0")
-                    # Skip dictionary/DAWG beam search overhead on UI button/channel labels
+                    # Skip dictionary/DAWG beam search overhead on UI labels and reject photo texture noise
                     lib.TessBaseAPISetVariable(a, b"load_system_dawg", b"0")
                     lib.TessBaseAPISetVariable(a, b"load_freq_dawg", b"0")
                     lib.TessBaseAPISetVariable(a, b"tessedit_enable_dict_correction", b"0")
+                    lib.TessBaseAPISetVariable(a, b"textord_heavy_nr", b"1")
                     lib.TessBaseAPISetVariable(a, b"debug_file", b"NUL" if sys.platform == "win32" else b"/dev/null")
                     apis.append(int(a))
                 if not apis:
@@ -601,7 +602,10 @@ class FastOCR:
         dark = (bg < 150.0) | ((g_f >= 75.0) & (g_f < 175.0) & (bg < 220.0))
         if not dark.any():
             return gray
-        inv_boost = np.clip(255.0 - np.maximum(0.0, g_f - bg) * (255.0 / np.maximum(64.0, 255.0 - bg)), 0.0, 255.0)
+        # Noise dead-zone (20) wipes out low-contrast photo/video ripples (~2x faster on media screens)
+        # while 0.35 contrast gain lifts dim UI placeholders (#6d6f78 on #1e1f22) well below Otsu threshold.
+        delta = np.maximum(0.0, (g_f - bg) - 20.0)
+        inv_boost = np.clip(255.0 - delta * (255.0 / np.maximum(48.0, (255.0 - bg) * 0.35)), 0.0, 255.0)
         return np.ascontiguousarray(np.where(dark, inv_boost, g_f).astype(np.uint8))
 
     def _scan_green_inprocess(
