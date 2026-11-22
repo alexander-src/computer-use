@@ -55,6 +55,7 @@ class A11yTree:
         self._ref_objs: dict[int, Any] = {}
         self._last_window_key: str = ""
         self._last_lines: dict[int, str] = {}
+        self._sparse_cache: dict[str, float] = {}
         self._available = self._init_atspi()
         atexit.register(self.close)
 
@@ -208,7 +209,7 @@ class A11yTree:
         window_rect: tuple[int, int, int, int] | None = None,
         find: str | None = None,
         max_elements: int = 120,
-        budget_ms: int = 220,
+        budget_ms: int = 110,
         diff: str | bool = "auto",
     ) -> dict[str, Any]:
         """Walk the target window's AT-SPI2 tree and return calibrated refs + text/diff."""
@@ -227,6 +228,16 @@ class A11yTree:
                 "available": False, "window_key": win_key, "elements": [], "text_lines": [],
                 "formatted": "(AT-SPI2 unavailable)", "is_diff": False, "elapsed_ms": 0.0,
             }
+        # Skip repeated AT-SPI2 DBus walks on known sparse/empty windows (e.g. Brave/Chrome/Electron/games) for 4s
+        if find is None and diff != False:
+            sparse_ts = self._sparse_cache.get(win_key)
+            if sparse_ts is not None and (t0 - sparse_ts) < 4.0:
+                self._last_window_key = win_key
+                return {
+                    "available": True, "window_key": win_key, "elements": [], "text_lines": [],
+                    "formatted": "(sparse AT-SPI2 window cached; using ~5ms visual + grid)",
+                    "is_diff": False, "elapsed_ms": 0.0,
+                }
         self.ensure_enabled()
         Atspi = self._atspi
         deadline = t0 + (budget_ms / 1000.0)
@@ -238,6 +249,7 @@ class A11yTree:
             self._ref_objs.clear()
             self._last_lines.clear()
             self._last_window_key = win_key
+            self._sparse_cache[win_key] = time.perf_counter()
             return {
                 "available": True, "window_key": win_key, "elements": [], "text_lines": [],
                 "formatted": "(no AT-SPI2 tree for active window; using visual screenshot + grid)",
@@ -332,6 +344,11 @@ class A11yTree:
         # Prune dead refs so stale widgets from closed tabs/dialogs never remain clickable
         self._ref_map = new_ref_map
         self._ref_objs = new_ref_objs
+        if find is None:
+            if len(elements) < 5:
+                self._sparse_cache[win_key] = time.perf_counter()
+            else:
+                self._sparse_cache.pop(win_key, None)
 
         if find:
             q = find.strip().lower()

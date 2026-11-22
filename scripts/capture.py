@@ -71,11 +71,20 @@ class TurboJpegEncoder:
         self._init()
 
     def _init(self) -> None:
-        candidates = (
-            [ctypes.util.find_library("turbojpeg"), "turbojpeg.dll"]
-            if sys.platform == "win32"
-            else [ctypes.util.find_library("turbojpeg"), "libturbojpeg.so.0", "libturbojpeg.so"]
-        )
+        if sys.platform == "win32":
+            candidates = [ctypes.util.find_library("turbojpeg"), "turbojpeg.dll"]
+        elif sys.platform == "darwin":
+            candidates = [
+                ctypes.util.find_library("turbojpeg"),
+                "/opt/homebrew/lib/libturbojpeg.dylib",
+                "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+                "/usr/local/lib/libturbojpeg.dylib",
+                "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+                "libturbojpeg.0.dylib",
+                "libturbojpeg.dylib",
+            ]
+        else:
+            candidates = [ctypes.util.find_library("turbojpeg"), "libturbojpeg.so.0", "libturbojpeg.so"]
         for cand in candidates:
             if not cand:
                 continue
@@ -610,8 +619,8 @@ class ScreenCapture:
         scope: str = "screen",
         area: tuple[int, int, int, int] | None = None,
         active_rect: tuple[int, int, int, int] | None = None,
-        max_wait_ms: int = 160,
-        poll_ms: int = 25,
+        max_wait_ms: int = 55,
+        poll_ms: int = 16,
         include_cursor: bool = False,
         ignore_rects_fn: Callable[[], list[tuple[int, int, int, int]]] | None = None,
     ) -> Frame:

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Ultra-fast cross-platform Computer Use MCP server for Linux (Wayland/X11) and Windows 10/11.
+"""Fast cross-platform Computer Use MCP server for Linux (Wayland/X11), Windows 10/11, and macOS.
 
 Highlights:
 - Linux capture: Direct org.kde.KWin.ScreenShot2 Unix FD pipe (~3.5 ms) + Cairo bilinear scale
-  + AVX2 libturbojpeg zero-copy encode (~1.5 ms -> ~5.2 ms full-screen JPEG!). Fallbacks:
+  + AVX2 libturbojpeg zero-copy encode (~1.5 ms -> ~5.2 ms full-screen JPEG). Fallbacks:
   GdkPixbuf (glycin-compatible), grim, spectacle, maim, scrot.
 - Windows capture: Per-Monitor DPI v2 GDI BitBlt + PrintWindow (for occluded background windows)
   + TurboJPEG or built-in Windows GDI+ zero-dep JPEG/PNG encoder with crisp 5x7 bitmap labels.
+- macOS capture: CoreGraphics CGWindowListCreateImage (with /usr/sbin/screencapture ScreenCaptureKit
+  fallback for macOS 15+ Sequoia / 26+), CGBitmapContext bilinear scale, Homebrew libturbojpeg or
+  built-in Apple ImageIO JPEG/PNG encoder, Retina HiDPI scale tracking, and 5x7 bitmap labels.
 - Independent AI Cursor + Smooth Glide: Custom click-through cyan AI pointer & animated click
-  ripples (Wayland zwlr_layer_shell_v1 / Win32 WS_EX_LAYERED+WDA_EXCLUDEFROMCAPTURE) that smoothly
-  glides to targets while preserving your physical mouse position (moving your mouse never aborts).
-- Background Computer Use: Authenticated isolated Xvfb virtual desktop (Linux) and child-HWND
-  PrintWindow + PostMessageW automation (Windows) for zero-touch background workflows.
-- Semantic Accessibility: AT-SPI2 (Linux, with Wayland global-coord calibration) & native MTA
-  IUIAutomation COM (Windows) with stable [ref] IDs, incremental AX_DIFF, and mouse-free actions.
+  ripples (Wayland zwlr_layer_shell_v1 / Win32 WS_EX_LAYERED+WDA_EXCLUDEFROMCAPTURE / macOS AppKit
+  NSWindow+NSWindowSharingNone) that smoothly glides while preserving your physical mouse position.
+- Background Computer Use: Isolated Xvfb virtual desktop (Linux), child-HWND PrintWindow +
+  PostMessageW (Windows), and occluded CGWindowList + AXPress / CGEventPostToPid (macOS).
+- Semantic Accessibility: AT-SPI2 (Linux), native MTA IUIAutomation COM (Windows), and native
+  ApplicationServices AXUIElement (macOS) with stable [ref] IDs, AX_DIFF, and mouse-free actions.
 """
 
 from __future__ import annotations
@@ -22,8 +25,10 @@ import argparse
 import json
 import math
 import os
+import platform
 import statistics
 import sys
+import threading
 import time
 from typing import Any
 
@@ -35,7 +40,7 @@ from capture import Frame
 from cursor_overlay import CursorOverlay
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -45,16 +50,16 @@ _LINUX_SHIFT_V_TERMINALS = (
 _WIN_SHIFT_V_TERMINALS = ("windowsterminal", "wezterm", "alacritty", "kitty", "mintty")
 
 SERVER_INSTRUCTIONS = (
-    "Ultra-fast Linux & Windows Computer Use MCP server. Use desktop_observe (AX/UIA-first with "
-    "automatic ~5 ms visual fallback) to discover windows and [ref] IDs, then chain multi-step "
-    "actions in desktop_act. Moving the user's mouse does not abort by default (the AI glides its "
-    "own custom cursor overlay and restores the user's cursor). Use desktop_background and "
-    "background=true for zero-touch background app automation on Linux (Xvfb) or Windows (PrintWindow/PostMessage)."
+    "Fast Linux, Windows, and macOS Computer Use MCP server. Use desktop_observe (AX/UIA-first with "
+    "automatic visual fallback) to discover windows and [ref] IDs, then chain multi-step actions in "
+    "desktop_act. Moving the user's mouse does not abort by default (the AI glides its own custom cursor "
+    "overlay and restores the user's cursor). Use desktop_background and background=true for zero-touch "
+    "background automation on Linux (Xvfb), Windows (PrintWindow/PostMessage), or macOS (CGWindowList/PostPid+AX)."
 )
 
 
 def _init_session_bus():
-    if sys.platform == "win32":
+    if sys.platform in ("win32", "darwin"):
         return None
     try:
         from dbus.mainloop.glib import DBusGMainLoop
@@ -123,6 +128,7 @@ class DesktopEngine:
         background=None,
     ):
         self._is_windows = sys.platform == "win32"
+        self._is_macos = sys.platform == "darwin"
         self._bus = bus if bus is not None else _init_session_bus()
 
         if self._is_windows:
@@ -140,6 +146,21 @@ class DesktopEngine:
             self.clipboard = clipboard or WinClipboard()
             self.input = input_driver or WinInputDriver(virtual_bounds_fn=self.windows.virtual_bounds)
             self.background = background or WinBackgroundSession(self.windows, self.capture)
+        elif self._is_macos:
+            from macos_backend import (
+                MacA11yTree,
+                MacBackgroundSession,
+                MacClipboard,
+                MacInputDriver,
+                MacScreenCapture,
+                MacWindowManager,
+            )
+            self.windows = windows or MacWindowManager()
+            self.capture = capture or MacScreenCapture(virtual_bounds_fn=self.windows.virtual_bounds)
+            self.a11y = a11y or MacA11yTree()
+            self.clipboard = clipboard or MacClipboard()
+            self.input = input_driver or MacInputDriver(virtual_bounds_fn=self.windows.virtual_bounds)
+            self.background = background or MacBackgroundSession(self.windows, self.capture, self.input)
         else:
             from a11y import A11yTree
             from capture import ScreenCapture
@@ -162,6 +183,10 @@ class DesktopEngine:
         self.last_image_rect: tuple[int, int, int, int] | None = None
         self.last_bg_image_rect: tuple[int, int, int, int] | None = None
         self._ai_cursor_pos: tuple[float, float] | None = None
+        self._clip_restore_gen = 0
+        self._clip_restore_timer: threading.Timer | None = None
+        self._clip_saved_orig: str | None = None
+        self._clip_restore_lock = threading.Lock()
         self._smooth_default = os.environ.get("COMPUTER_USE_SMOOTH_CURSOR", "1").strip().lower() not in ("0", "false", "off")
         self._independent_cursor_default = os.environ.get("COMPUTER_USE_INDEPENDENT_CURSOR", "1").strip().lower() not in ("0", "false", "off")
         self._audit_path = os.environ.get("COMPUTER_USE_AUDIT_LOG", "").strip() or None
@@ -227,10 +252,10 @@ class DesktopEngine:
                 self.input.move(tx, ty)
             return
 
-        dur_ms = int(duration_ms) if duration_ms is not None else int(max(55.0, min(175.0, 48.0 + dist * 0.11)))
-        steps = max(6, min(26, dur_ms // 8))
+        dur_ms = int(duration_ms) if duration_ms is not None else int(max(20.0, min(55.0, 16.0 + dist * 0.032)))
+        steps = max(4, min(10, dur_ms // 6))
         dt = (dur_ms / 1000.0) / steps
-        arc = min(14.0, dist * 0.035)
+        arc = min(10.0, dist * 0.028)
         nx_perp = -dy / dist
         ny_perp = dx / dist
 
@@ -297,9 +322,9 @@ class DesktopEngine:
         if background:
             if self.last_bg_image_rect is not None:
                 return self.last_bg_image_rect
-            if self._is_windows and self.background.active and hasattr(self.background, "window_rect"):
+            if (self._is_windows or self._is_macos) and self.background.active and hasattr(self.background, "window_rect"):
                 return self.background.window_rect()
-            if not self._is_windows and self.background.active:
+            if not (self._is_windows or self._is_macos) and self.background.active:
                 bw, bh = self.background.size
                 return (0, 0, bw, bh)
             return self._virtual_bounds()
@@ -369,25 +394,69 @@ class DesktopEngine:
         terms = _WIN_SHIFT_V_TERMINALS if self._is_windows else _LINUX_SHIFT_V_TERMINALS
         return any(tc in app for tc in terms)
 
+    def _cancel_clip_restore(self) -> None:
+        with self._clip_restore_lock:
+            self._clip_restore_gen += 1
+            if self._clip_restore_timer is not None:
+                self._clip_restore_timer.cancel()
+                self._clip_restore_timer = None
+            self._clip_saved_orig = None
+
+    def _restore_user_cursor(self, x: int, y: int) -> None:
+        if hasattr(self.input, "restore_cursor"):
+            self.input.restore_cursor(x, y)
+        else:
+            self.input.move(x, y)
+
     def _type_with_atomic_paste(self, text: str, active_win: dict[str, Any] | None) -> str:
         """Paste text via clipboard while preserving and restoring prior non-empty text clipboard."""
-        prev_clip: str | None = None
-        try:
-            prev_clip = self.clipboard.get_text()
-        except Exception:
-            prev_clip = None
+        with self._clip_restore_lock:
+            saved_orig = self._clip_saved_orig
+        if saved_orig is not None:
+            prev_clip: str | None = saved_orig
+        else:
+            try:
+                prev_clip = self.clipboard.get_text()
+            except Exception:
+                prev_clip = None
 
         self.clipboard.set_text(text)
-        time.sleep(0.015)
-        paste_combo = "ctrl+shift+v" if self._needs_ctrl_shift_v(active_win) else "ctrl+v"
+        time.sleep(0.008)
+        if self._is_macos:
+            paste_combo = "cmd+v"
+        else:
+            paste_combo = "ctrl+shift+v" if self._needs_ctrl_shift_v(active_win) else "ctrl+v"
         self.input.hotkey(paste_combo)
-        # Allow Electron/Chromium/Wayland apps enough time to fetch async clipboard selection before restoring
-        time.sleep(0.11)
         if prev_clip:
-            try:
-                self.clipboard.set_text(prev_clip)
-            except Exception:
-                pass
+            if self.clipboard.backend == "mock":
+                try:
+                    self.clipboard.set_text(prev_clip)
+                except Exception:
+                    pass
+            else:
+                # Non-blocking async clipboard restore saves ~110 ms per paste while preserving original user clip across chained pastes
+                with self._clip_restore_lock:
+                    self._clip_restore_gen += 1
+                    gen = self._clip_restore_gen
+                    self._clip_saved_orig = prev_clip
+                    if self._clip_restore_timer is not None:
+                        self._clip_restore_timer.cancel()
+
+                    def _restore_clip(expected_gen: int = gen, saved: str = prev_clip) -> None:
+                        with self._clip_restore_lock:
+                            if self._clip_restore_gen != expected_gen:
+                                return
+                            self._clip_saved_orig = None
+                            self._clip_restore_timer = None
+                        try:
+                            self.clipboard.set_text(saved)
+                        except Exception:
+                            pass
+
+                    timer = threading.Timer(0.11, _restore_clip)
+                    timer.daemon = True
+                    self._clip_restore_timer = timer
+                    timer.start()
         return f"paste({paste_combo})"
 
     def _check_user_takeover(self) -> tuple[bool, tuple[int, int] | None]:
@@ -441,16 +510,34 @@ class DesktopEngine:
 
     def tool_status(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         vx, vy, vw, vh = self._virtual_bounds()
+        mac_perms: dict[str, bool] | None = None
         if self._is_windows:
             session = "windows-win32"
             desktop = "Windows"
             uinput_writable = None
+            a11y_label = "uia-com"
+        elif self._is_macos:
+            session = "macos-aqua"
+            ver = platform.mac_ver()[0]
+            desktop = f"macOS {ver}".strip()
+            uinput_writable = None
+            a11y_label = "axuielement"
+            try:
+                from macos_backend import _MacFrameworks
+                fw = _MacFrameworks.get()
+                mac_perms = {
+                    "accessibility": fw.accessibility_granted(),
+                    "screen_recording": fw.screen_recording_granted(),
+                }
+            except Exception:
+                mac_perms = None
         else:
             session = "wayland" if os.environ.get("WAYLAND_DISPLAY") else ("x11" if os.environ.get("DISPLAY") else "headless")
             desktop = os.environ.get("XDG_CURRENT_DESKTOP", "unknown")
             uinput_writable = os.access("/dev/uinput", os.W_OK)
+            a11y_label = "atspi2"
 
-        info = {
+        info: dict[str, Any] = {
             "server": f"{SERVER_NAME} {SERVER_VERSION}",
             "platform": sys.platform,
             "session": session,
@@ -461,7 +548,7 @@ class DesktopEngine:
                 "input": self.input.backend,
                 "windows": self.windows.backend,
                 "clipboard": self.clipboard.backend,
-                "a11y": ("uia-com" if self._is_windows else "atspi2") if self.a11y.available else "unavailable",
+                "a11y": a11y_label if self.a11y.available else "unavailable",
                 "cursor_overlay": self.overlay.backend,
                 "background": self.background.status(),
             },
@@ -471,6 +558,8 @@ class DesktopEngine:
             "cached_refs": len(self.a11y._ref_map),
             "last_image_rect": list(self.last_image_rect) if self.last_image_rect else None,
         }
+        if mac_perms is not None:
+            info["macos_permissions"] = mac_perms
         return [{"type": "text", "text": json.dumps(info, indent=2)}]
 
     def tool_background(self, args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -480,25 +569,33 @@ class DesktopEngine:
         if action == "stop":
             self.last_bg_image_rect = None
             return [{"type": "text", "text": json.dumps(self.background.stop(), indent=2)}]
-        if self._is_windows:
+        if self._is_windows or self._is_macos:
+            launch_kw: dict[str, Any] = {"wait_app": args.get("wait_app"), "timeout_ms": int(args.get("timeout_ms", 4000))}
+            if self._is_macos:
+                launch_kw["background"] = True
             if action in ("start", "attach"):
                 if args.get("command"):
-                    launched = self.windows.launch(args["command"], wait_app=args.get("wait_app"), timeout_ms=int(args.get("timeout_ms", 4000)))
+                    launched = self.windows.launch(args["command"], **launch_kw)
                     win = launched.get("window")
+                    if win:
+                        self.last_bg_image_rect = None
                     res = self.background.attach(window_id=win["id"]) if win else {"launched": launched, **self.background.status()}
                     return [{"type": "text", "text": json.dumps(res, indent=2)}]
+                self.last_bg_image_rect = None
                 res = self.background.attach(window_id=args.get("window_id"), app=args.get("app"), title=args.get("title"))
                 return [{"type": "text", "text": json.dumps(res, indent=2)}]
             if action == "launch":
                 cmd = args.get("command")
                 if not cmd:
                     raise ValueError("Missing 'command' for desktop_background(action='launch')")
-                launched = self.windows.launch(cmd, wait_app=args.get("wait_app"), timeout_ms=int(args.get("timeout_ms", 4000)))
+                launched = self.windows.launch(cmd, **launch_kw)
                 win = launched.get("window")
                 if win:
+                    self.last_bg_image_rect = None
                     self.background.attach(window_id=win["id"])
                 return [{"type": "text", "text": json.dumps({"launched": launched, "background": self.background.status()}, indent=2)}]
-            raise ValueError(f"Unsupported Windows background action: {action!r}")
+            os_name = "macOS" if self._is_macos else "Windows"
+            raise ValueError(f"Unsupported {os_name} background action: {action!r}")
         else:
             if action == "start":
                 res = self.background.start(width=int(args.get("width", 1920)), height=int(args.get("height", 1080)))
@@ -533,10 +630,14 @@ class DesktopEngine:
             cmd = args.get("command")
             if not cmd:
                 raise ValueError("Missing 'command' for launch")
-            if args.get("background") and not self._is_windows:
+            if args.get("background") and not (self._is_windows or self._is_macos):
                 return [{"type": "text", "text": json.dumps(self.background.launch(cmd, wait_ms=int(args.get("wait_ms", 500))), indent=2)}]
-            res = self.windows.launch(cmd, wait_app=args.get("wait_app"), timeout_ms=int(args.get("timeout_ms", 4000)))
-            if args.get("background") and self._is_windows and res.get("window"):
+            launch_kw: dict[str, Any] = {"wait_app": args.get("wait_app"), "timeout_ms": int(args.get("timeout_ms", 4000))}
+            if self._is_macos and args.get("background"):
+                launch_kw["background"] = True
+            res = self.windows.launch(cmd, **launch_kw)
+            if args.get("background") and (self._is_windows or self._is_macos) and res.get("window"):
+                self.last_bg_image_rect = None
                 self.background.attach(window_id=res["window"]["id"])
             return [{"type": "text", "text": json.dumps(res, indent=2)}]
         res = self.windows.control(
@@ -553,10 +654,12 @@ class DesktopEngine:
         if action == "get":
             return [{"type": "text", "text": self.clipboard.get_text()}]
         if action == "set":
+            self._cancel_clip_restore()
             val = str(args.get("text", ""))
             self.clipboard.set_text(val)
             return [{"type": "text", "text": f"Clipboard set ({len(val)} chars) via {self.clipboard.backend}"}]
         if action == "clear":
+            self._cancel_clip_restore()
             self.clipboard.set_text("")
             return [{"type": "text", "text": f"Clipboard cleared via {self.clipboard.backend}"}]
         raise ValueError(f"Unsupported clipboard action: {action!r}")
@@ -675,8 +778,8 @@ class DesktopEngine:
         ss_opt = args.get("screenshot", "auto")
         scope = (args.get("scope") or "screen").lower()
         max_elements = int(args.get("max_elements", 100))
-        max_width = int(args.get("max_width", 1280))
-        quality = int(args.get("quality", 75))
+        max_width = int(args.get("max_width", 1024))
+        quality = int(args.get("quality", 68))
 
         st = self.windows.state()
         win_ms = (time.perf_counter() - t0) * 1000.0
@@ -753,18 +856,22 @@ class DesktopEngine:
             raise ValueError("'steps' must be a non-empty list")
 
         bg = bool(args.get("background", False))
-        verify_change = bool(args.get("verify_change", True))
+        fast = bool(args.get("fast", False))
+        observe_opt = str(args.get("observe", "auto")).lower()
+        if "verify_change" in args:
+            verify_change = bool(args["verify_change"])
+        else:
+            verify_change = False if (fast or observe_opt == "none") else True
         detect_takeover = bool(args.get("detect_takeover", False))
         # If caller explicitly opted into detect_takeover=True without setting independent_cursor, honor takeover mode
         if "independent_cursor" in args:
             independent_cursor = bool(args["independent_cursor"])
         else:
             independent_cursor = False if detect_takeover else self._independent_cursor_default
-        smooth = args.get("smooth", self._smooth_default)
-        settle_opt = args.get("settle", "smart")
-        observe_opt = str(args.get("observe", "auto")).lower()
-        max_width = int(args.get("max_width", 1280))
-        quality = int(args.get("quality", 75))
+        smooth = False if fast else args.get("smooth", self._smooth_default)
+        settle_opt = args.get("settle", "none" if (fast or (observe_opt == "none" and not verify_change)) else "smart")
+        max_width = int(args.get("max_width", 1024))
+        quality = int(args.get("quality", 68))
 
         st_before = self.windows.state() if not bg else {"active": None, "cursor": {"x": 0, "y": 0}}
         active_win = st_before.get("active")
@@ -834,7 +941,7 @@ class DesktopEngine:
                     try:
                         # Match include_cursor=False with before_frame and ignore our own AI cursor/ripple rects!
                         after_frame = self.capture.wait_until_settled(
-                            scope="screen", max_wait_ms=160, poll_ms=25,
+                            scope="screen", max_wait_ms=55, poll_ms=16,
                             include_cursor=False, ignore_rects_fn=self._overlay_ignore_rects,
                         )
                     except Exception:
@@ -978,10 +1085,10 @@ class DesktopEngine:
                 self.background.click(pt[0], pt[1])
                 time.sleep(0.03)
             if step.get("clear"):
-                self.background.hotkey("ctrl+a")
-                time.sleep(0.015)
+                self.background.hotkey("cmd+a" if self._is_macos else "ctrl+a")
+                time.sleep(0.008)
                 self.background.hotkey("backspace")
-                time.sleep(0.015)
+                time.sleep(0.008)
             text = str(step.get("text", ""))
             self.background.type_text(text)
             if step.get("submit"):
@@ -998,9 +1105,13 @@ class DesktopEngine:
             cmd = step.get("command")
             if not cmd:
                 raise ValueError("Missing 'command' for launch")
-            if self._is_windows:
-                launched = self.windows.launch(cmd, wait_app=step.get("wait_app"), timeout_ms=int(step.get("timeout_ms", 4000)))
+            if self._is_windows or self._is_macos:
+                launch_kw: dict[str, Any] = {"wait_app": step.get("wait_app"), "timeout_ms": int(step.get("timeout_ms", 4000))}
+                if self._is_macos:
+                    launch_kw["background"] = True
+                launched = self.windows.launch(cmd, **launch_kw)
                 if launched.get("window"):
+                    self.last_bg_image_rect = None
                     self.background.attach(window_id=launched["window"]["id"])
                 return launched, extra_images
             return self.background.launch(cmd, wait_ms=int(step.get("wait_ms", 500))), extra_images
@@ -1046,9 +1157,11 @@ class DesktopEngine:
                     self._glide_ai_cursor(pt[0], pt[1], label=lbl, smooth=smooth, duration_ms=step.get("duration_ms"), move_os_cursor=True)
                     already_moved = True
 
+            click_pt_x = pt[0] if (pt is not None and (not already_moved or self._is_macos)) else None
+            click_pt_y = pt[1] if (pt is not None and (not already_moved or self._is_macos)) else None
             pos = self.input.click(
-                None if already_moved else (pt[0] if pt else None),
-                None if already_moved else (pt[1] if pt else None),
+                click_pt_x,
+                click_pt_y,
                 button=button,
                 count=count,
                 modifiers=mods,
@@ -1058,9 +1171,9 @@ class DesktopEngine:
             if pt is not None:
                 self.overlay.show_click(pt[0], pt[1], button=button, double=(count >= 2))
             if saved_user_pos is not None:
-                # Give compositor ~14 ms to dispatch button-release/focus before restoring user's physical cursor
-                time.sleep(0.014)
-                self.input.move(saved_user_pos[0], saved_user_pos[1])
+                # Brief compositor settle before restoring user's physical cursor
+                time.sleep(0.006)
+                self._restore_user_cursor(saved_user_pos[0], saved_user_pos[1])
             return {"pos": list(pos) if pos else None, "button": button, "count": count}, extra_images, active_win
 
         if op in ("move", "hover"):
@@ -1084,8 +1197,8 @@ class DesktopEngine:
             )
             self._ai_cursor_pos = (float(end[0]), float(end[1]))
             if saved_user_pos is not None:
-                time.sleep(0.014)
-                self.input.move(saved_user_pos[0], saved_user_pos[1])
+                time.sleep(0.010)
+                self._restore_user_cursor(saved_user_pos[0], saved_user_pos[1])
             return {"from": list(start), "to": list(end)}, extra_images, active_win
 
         if op == "scroll":
@@ -1099,8 +1212,8 @@ class DesktopEngine:
                     saved_user_pos = self._safe_user_cursor()
             self.input.scroll(direction=direction, clicks=clicks, x=pt[0] if pt else None, y=pt[1] if pt else None)
             if saved_user_pos is not None:
-                time.sleep(0.010)
-                self.input.move(saved_user_pos[0], saved_user_pos[1])
+                time.sleep(0.005)
+                self._restore_user_cursor(saved_user_pos[0], saved_user_pos[1])
             return {"direction": direction, "clicks": clicks, "pos": list(pt) if pt else None}, extra_images, active_win
 
         if op == "type":
@@ -1113,18 +1226,22 @@ class DesktopEngine:
                     saved_user_pos = self._safe_user_cursor()
                 self.input.click(pt[0], pt[1])
                 self.overlay.show_click(pt[0], pt[1], button="left")
-                time.sleep(0.03)
-                active_win = self.windows.state().get("active")
+                time.sleep(0.010)
+                if active_win is None or not (
+                    active_win["x"] <= pt[0] < active_win["x"] + active_win["w"]
+                    and active_win["y"] <= pt[1] < active_win["y"] + active_win["h"]
+                ):
+                    active_win = self.windows.state().get("active")
             try:
                 if step.get("clear"):
-                    self.input.hotkey("ctrl+a")
-                    time.sleep(0.015)
+                    self.input.hotkey("cmd+a" if self._is_macos else "ctrl+a")
+                    time.sleep(0.006)
                     self.input.hotkey("backspace")
-                    time.sleep(0.015)
+                    time.sleep(0.006)
 
                 mode = str(step.get("mode", "auto")).lower()
-                # On Windows, KEYEVENTF_UNICODE handles up to 500 chars directly with zero clipboard touch!
-                key_len_limit = 500 if self._is_windows else 24
+                # Windows (KEYEVENTF_UNICODE) handles up to 500 chars; macOS 1-char Unicode events handle up to 120 chars cleanly
+                key_len_limit = 500 if self._is_windows else (120 if self._is_macos else 24)
                 use_paste = (mode == "paste") or (
                     mode == "auto" and (len(text) > key_len_limit or not self.input.is_pure_ascii_typable(text))
                 )
@@ -1132,18 +1249,24 @@ class DesktopEngine:
                     method = self._type_with_atomic_paste(text, active_win)
                 else:
                     self.input.type_keys(text, key_delay_ms=int(step.get("key_delay_ms", 0)))
-                    method = "win32-unicode" if self._is_windows else f"uinput({getattr(self.input, 'layout', 'us')})"
+                    if self._is_windows:
+                        method = "win32-unicode"
+                    elif self._is_macos:
+                        method = "macos-unicode"
+                    else:
+                        method = f"uinput({getattr(self.input, 'layout', 'us')})"
 
                 if step.get("submit"):
-                    time.sleep(0.02)
+                    time.sleep(0.035 if method.startswith("paste") else 0.008)
                     self.input.hotkey("enter")
             finally:
                 if saved_user_pos is not None:
-                    time.sleep(0.012)
-                    self.input.move(saved_user_pos[0], saved_user_pos[1])
+                    time.sleep(0.006)
+                    self._restore_user_cursor(saved_user_pos[0], saved_user_pos[1])
             return {"chars": len(text), "method": method, "submitted": bool(step.get("submit"))}, extra_images, active_win
 
         if op in ("key", "hotkey", "press"):
+            self._cancel_clip_restore()
             keys = step.get("keys") if step.get("keys") is not None else step.get("key")
             if not keys:
                 raise ValueError("Missing 'keys' (e.g. 'ctrl+s' or 'enter')")
@@ -1241,8 +1364,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "desktop_observe",
         "description": (
-            "Observe the Linux or Windows desktop in 1 call: window list + active window + cursor (~1.2 ms) "
-            "+ semantic accessibility [ref] tree (AT-SPI2 / Windows UIA with incremental AX_DIFF) "
+            "Observe the Linux, Windows, or macOS desktop in 1 call: window list + active window + cursor (~1.2 ms) "
+            "+ semantic accessibility [ref] tree (AT-SPI2 / UIA / AXUIElement with incremental AX_DIFF) "
             "+ automatic ~5 ms JPEG screenshot with Set-of-Marks/grid when AX has <5 elements. Pass background=true for background session."
         ),
         "inputSchema": {
@@ -1257,17 +1380,17 @@ TOOLS: list[dict[str, Any]] = [
                 "annotate": {"type": "boolean", "description": "Draw Set-of-Marks [ref] badges on screenshot."},
                 "grid": {"type": "boolean", "description": "Draw 0..1000 normalized coordinate grid on screenshot."},
                 "max_elements": {"type": "integer", "default": 100},
-                "max_width": {"type": "integer", "default": 1280},
-                "quality": {"type": "integer", "default": 75},
+                "max_width": {"type": "integer", "default": 1024},
+                "quality": {"type": "integer", "default": 68},
             },
         },
     },
     {
         "name": "desktop_act",
         "description": (
-            "Execute batched desktop actions with an independent smooth-gliding cyan AI cursor + animated click "
-            "ripples (preserving your physical mouse; moving your mouse does not abort). Supports background=true "
-            "for zero-touch background execution (Linux Xvfb / Windows PostMessage)."
+            "Execute batched desktop actions at human speed with an independent smooth-gliding cyan AI cursor + animated click "
+            "ripples (preserving your physical mouse; moving your mouse does not abort). Chain focus+click+type+key in ONE call "
+            "and pass fast=true or observe='none' for instant multi-step bursts. Supports background=true on Linux, Windows, & macOS."
         ),
         "inputSchema": {
             "type": "object",
@@ -1279,6 +1402,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "op": {"type": "string", "description": "Single-step shorthand op when 'steps' is omitted."},
                 "background": {"type": "boolean", "default": False},
+                "fast": {"type": "boolean", "default": False, "description": "Instant 0ms cursor snap and skip settle/diff for maximum speed."},
                 "smooth": {"type": "boolean", "default": True},
                 "independent_cursor": {"type": "boolean", "default": True},
                 "settle": {"oneOf": [{"type": "string", "enum": ["smart", "none"]}, {"type": "integer"}], "default": "smart"},
@@ -1323,7 +1447,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "desktop_windows",
-        "description": "List, focus, minimize, maximize, unmaximize, move/resize, close, or launch desktop windows (Linux & Windows).",
+        "description": "List, focus, minimize, maximize, unmaximize, move/resize, close, or launch desktop windows (Linux, Windows, & macOS).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1349,9 +1473,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "desktop_background",
         "description": (
-            "Manage zero-touch background computer use: starts an authenticated isolated Xvfb virtual desktop on Linux "
-            "(own mouse, keyboard, and screen buffer) or attaches child-HWND PrintWindow + PostMessageW to a target "
-            "background window on Windows without moving your mouse or stealing focus."
+            "Manage zero-touch background computer use: starts an authenticated isolated Xvfb virtual desktop on Linux, "
+            "attaches child-HWND PrintWindow + PostMessageW on Windows, or attaches occluded CGWindowList + AXPress / "
+            "CGEventPostToPid on macOS without moving your mouse or stealing focus."
         ),
         "inputSchema": {
             "type": "object",
@@ -1371,7 +1495,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "desktop_clipboard",
-        "description": "Read, write, or clear the system clipboard (Klipper DBus / wl-clipboard / xclip on Linux, Win32 CF_UNICODETEXT on Windows).",
+        "description": "Read, write, or clear the system clipboard (Klipper/wl-clipboard/xclip on Linux, Win32 CF_UNICODETEXT on Windows, pbcopy/pbpaste on macOS).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1528,13 +1652,28 @@ def run_selftest(server: MCPServer) -> int:
         check("desktop_clipboard(get)", not r_clip["result"]["isError"], f"backend={server.engine.clipboard.backend}")
 
     if server.engine.capture.backend != "unavailable":
-        vx, vy, vw, vh = server.engine._virtual_bounds()
-        r_ss = server.handle_request({
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-            "params": {"name": "desktop_screenshot", "arguments": {"scope": "area", "area": [vx, vy, min(400, vw), min(300, vh)], "grid": True}},
-        })
-        ok_ss = (not r_ss["result"]["isError"]) and len(r_ss["result"]["content"]) == 2 and r_ss["result"]["content"][1]["type"] == "image"
-        check("desktop_screenshot(area+grid)", ok_ss, r_ss["result"]["content"][0]["text"])
+        run_live_ss = True
+        if sys.platform == "darwin":
+            try:
+                from macos_backend import _MacFrameworks
+                fw = _MacFrameworks.get()
+                run_live_ss = bool(fw.screen_recording_granted() and int(fw.cg.CGMainDisplayID()) != 0)
+            except Exception:
+                run_live_ss = False
+        if run_live_ss:
+            vx, vy, vw, vh = server.engine._virtual_bounds()
+            r_ss = server.handle_request({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "desktop_screenshot", "arguments": {"scope": "area", "area": [vx, vy, min(400, vw), min(300, vh)], "grid": True}},
+            })
+            ok_ss = (not r_ss["result"]["isError"]) and len(r_ss["result"]["content"]) == 2 and r_ss["result"]["content"][1]["type"] == "image"
+            check("desktop_screenshot(area+grid)", ok_ss, r_ss["result"]["content"][0]["text"])
+        else:
+            import numpy as np
+            print("  [SKIP] desktop_screenshot(live): macOS Screen Recording permission not granted or headless display")
+            syn = Frame(rgba=np.full((120, 200, 4), 120, dtype=np.uint8), origin_x=0, origin_y=0, width=200, height=120, scale=1.0, backend="synthetic", capture_ms=0.1)
+            enc = server.engine.capture.encode(syn, max_width=160, fmt="jpeg", quality=75, grid=True)
+            check("desktop_screenshot(synthetic encode+grid)", enc["bytes"] > 200, f"{enc['image_w']}x{enc['image_h']} {enc['bytes']} B")
 
     r_obs = server.handle_request({
         "jsonrpc": "2.0", "id": 7, "method": "tools/call",
@@ -1573,9 +1712,9 @@ def run_bench(server: MCPServer, runs: int = 5) -> int:
             return f"{f.width}x{f.height}"
 
         bench(f"capture full screen [{eng.capture.backend}]", cap_full)
-        bench("capture 400x300 area", lambda: f"{eng.capture.capture(scope='area', area=(vx, vy, min(400, vw), min(300, vh))).width}x{min(300, vh)}")
-        bench("encode 1280w JPEG q=75", lambda: f"{eng.capture.encode(f_full[0], max_width=1280, quality=75)['bytes']//1024} KB")
-        bench("encode 1280w JPEG + grid + cursor", lambda: f"{eng.capture.encode(f_full[0], max_width=1280, quality=75, grid=True, cursor=(vx + 400, vy + 300))['bytes']//1024} KB")
+        bench("capture 400x300 area", lambda: (lambda f: f"{f.width}x{f.height}")(eng.capture.capture(scope='area', area=(vx, vy, min(400, vw), min(300, vh)))))
+        bench("encode 1024w JPEG q=68", lambda: f"{eng.capture.encode(f_full[0], max_width=1024, quality=68)['bytes']//1024} KB")
+        bench("encode 1024w JPEG + grid + cursor", lambda: f"{eng.capture.encode(f_full[0], max_width=1024, quality=68, grid=True, cursor=(vx + 400, vy + 300))['bytes']//1024} KB")
         f2 = eng.capture.capture(scope="screen", include_cursor=True)
         bench("numpy diff_frames", lambda: f"changed={eng.capture.diff_frames(f_full[0], f2)['changed_pct']}%")
     if eng.a11y.available:
@@ -1608,7 +1747,7 @@ def run_demo_cursor(server: MCPServer) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Antigravity Linux & Windows Computer Use MCP server")
+    parser = argparse.ArgumentParser(description="Antigravity Linux, Windows, & macOS Computer Use MCP server")
     parser.add_argument("--selftest", action="store_true", help="Run non-destructive protocol and backend checks")
     parser.add_argument("--bench", action="store_true", help="Run non-destructive latency benchmarks")
     parser.add_argument("--demo-cursor", action="store_true", help="Preview the smooth custom AI cursor and click ripples (no real clicks)")

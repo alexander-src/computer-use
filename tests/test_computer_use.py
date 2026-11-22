@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ import a11y
 import capture
 import computer_use_mcp as mcp
 import cursor_overlay
+import macos_backend
 import uinput_driver
 import win32_backend
 
@@ -295,6 +297,45 @@ class TestInputAndLayouts(unittest.TestCase):
         units = win32_backend.text_to_utf16_units("A\U0001F680")
         self.assertEqual(units, [0x0041, 0xD83D, 0xDE80])
 
+    def test_macos_keycodes_utf16_structs_and_appkit_coords(self):
+        # Exact CoreGraphics C struct ABI sizes (CGFloat = double on 64-bit macOS)
+        self.assertEqual(ctypes.sizeof(macos_backend.CGPoint), 16)
+        self.assertEqual(ctypes.sizeof(macos_backend.CGSize), 16)
+        self.assertEqual(ctypes.sizeof(macos_backend.CGRect), 32)
+
+        # Key combo parser (including cmd++ edge case & modifiers)
+        codes, flags = macos_backend.parse_mac_key_combo("cmd+shift+s")
+        self.assertEqual(codes, [0x37, 0x38, 0x01])
+        self.assertEqual(flags, macos_backend.MAC_FLAG_CMD | macos_backend.MAC_FLAG_SHIFT)
+        codes_plus, flags_plus = macos_backend.parse_mac_key_combo("cmd++")
+        self.assertEqual(codes_plus, [0x37, 0x18])
+        self.assertEqual(flags_plus, macos_backend.MAC_FLAG_CMD)
+        self.assertEqual(macos_backend.parse_mac_key_combo(" "), ([0x31], 0))
+        self.assertEqual(macos_backend.parse_mac_key_combo("cmd+ "), ([0x37, 0x31], macos_backend.MAC_FLAG_CMD))
+
+        # UTF-16 surrogate-safe chunker never splits a surrogate pair across chunks (including max_units=1!)
+        self.assertEqual(macos_backend.split_utf16_chunks("A\U0001F680B", max_units=1), [[0x0041], [0xD83D, 0xDE80], [0x0042]])
+        sample = "abc\U0001F680def\U0001F525xyz" * 3
+        for cap in (1, 2, 3, 5, 7, 16):
+            chunks = macos_backend.split_utf16_chunks(sample, max_units=cap)
+            reconstructed = bytearray()
+            for ch in chunks:
+                self.assertGreater(len(ch), 0)
+                self.assertFalse(0xD800 <= ch[-1] <= 0xDBFF, f"Split high surrogate in {ch}")
+                self.assertFalse(0xDC00 <= ch[0] <= 0xDFFF, f"Orphan low surrogate in {ch}")
+                for u in ch:
+                    reconstructed.extend(u.to_bytes(2, "little"))
+            self.assertEqual(reconstructed.decode("utf-16-le"), sample)
+
+        # AppKit bottom-left coordinate conversion (primary and negative-Y secondary monitor)
+        self.assertEqual(macos_backend.cg_top_left_to_appkit_bottom_left(100, 50, 160, 900), (100.0, 690.0))
+        self.assertEqual(macos_backend.cg_top_left_to_appkit_bottom_left(-400, -200, 160, 900), (-400.0, 940.0))
+
+        # AX role normalization
+        self.assertEqual(macos_backend.normalize_mac_role("AXButton"), "button")
+        self.assertEqual(macos_backend.normalize_mac_role("AXPopUpButton"), "combobox")
+        self.assertEqual(macos_backend.normalize_mac_role("AXTextField"), "text")
+
     def test_negative_multimonitor_virtual_bounds(self):
         bounds = (-1920, -200, 3840, 1280)
         drv = uinput_driver.InputDriver(screen_size_fn=lambda: (3840, 1280), virtual_bounds_fn=lambda: bounds)
@@ -347,7 +388,7 @@ class TestCaptureAndOverlayRendering(unittest.TestCase):
             else:
                 os.environ["WAYLAND_DISPLAY"] = old_wl
 
-    @unittest.skipIf(sys.platform == "win32", "Cairo/GdkPixbuf test runs on Linux")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Cairo/GdkPixbuf test runs on Linux")
     def test_encode_turbojpeg_and_png_with_cairo_overlays(self):
         f = SyntheticCapture._make_frame(640, 480, (25, 35, 55, 255))
         sc = SyntheticCapture()
@@ -464,6 +505,7 @@ class TestEngineAndProtocol(unittest.TestCase):
         # Linux auto mode: >24 chars in terminal uses atomic ctrl+shift+v paste and restores clipboard
         eng, wm, clip, inp, ax, ov, bg = self._make_engine(active_app="konsole")
         eng._is_windows = False
+        eng._is_macos = False
         eng.tool_act({
             "steps": [{"op": "type", "text": "echo 'hello world from terminal paste test'"}],
             "settle": "none",
@@ -476,6 +518,7 @@ class TestEngineAndProtocol(unittest.TestCase):
         # Windows auto mode: <=500 chars uses KEYEVENTF_UNICODE directly without touching clipboard
         eng_w, _, clip_w, inp_w, _, _, _ = self._make_engine(active_app="powershell")
         eng_w._is_windows = True
+        eng_w._is_macos = False
         eng_w.tool_act({
             "steps": [{"op": "type", "text": "echo 'hello world from windows unicode typing'"}],
             "settle": "none",
@@ -497,6 +540,7 @@ class TestEngineAndProtocol(unittest.TestCase):
 
         eng_wt, _, clip_wt, inp_wt, _, _, _ = self._make_engine(active_app="windowsterminal")
         eng_wt._is_windows = True
+        eng_wt._is_macos = False
         eng_wt.tool_act({
             "steps": [{"op": "type", "text": "pasted-wt", "mode": "paste"}],
             "settle": "none",
@@ -505,6 +549,24 @@ class TestEngineAndProtocol(unittest.TestCase):
         })
         self.assertIn(("hotkey", ("ctrl+shift+v", 1)), inp_wt.events)
         self.assertEqual(clip_wt.value, "saved-user-clip")
+
+        # macOS auto mode uses CGEventKeyboardSetUnicodeString; clear=True uses cmd+a; paste uses cmd+v
+        eng_m, _, clip_m, inp_m, _, _, _ = self._make_engine(active_app="Terminal")
+        eng_m._is_windows = False
+        eng_m._is_macos = True
+        eng_m.tool_act({
+            "steps": [
+                {"op": "type", "text": "echo 'hello macos unicode typing'", "clear": True},
+                {"op": "type", "text": "pasted-mac", "mode": "paste"},
+            ],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn(("hotkey", ("cmd+a", 1)), inp_m.events)
+        self.assertIn(("type_keys", "echo 'hello macos unicode typing'"), inp_m.events)
+        self.assertIn(("hotkey", ("cmd+v", 1)), inp_m.events)
+        self.assertEqual(clip_m.value, "saved-user-clip")
 
     def test_mcp_protocol_7_tools_and_audit_log(self):
         with tempfile.TemporaryDirectory() as td:
@@ -541,15 +603,16 @@ class TestEngineAndProtocol(unittest.TestCase):
             text=True,
             encoding="utf-8",
         ) as proc:
-            stdout, _ = proc.communicate(payload, timeout=10)
+            stdout, stderr = proc.communicate(payload, timeout=20)
+            self.assertEqual(proc.returncode, 0, msg=stderr)
             lines = [json.loads(line) for line in stdout.splitlines() if line.strip()]
-            self.assertEqual(len(lines), 3)
+            self.assertEqual(len(lines), 3, msg=stderr)
             self.assertEqual(len(lines[1]["result"]["tools"]), 7)
             status = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertIn("backends", status)
 
 
-@unittest.skipUnless(sys.platform != "win32" and shutil.which("Xvfb"), "Requires Linux with Xvfb")
+@unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("Xvfb"), "Requires Linux with Xvfb")
 class TestLinuxXvfbBackground(unittest.TestCase):
     def test_xvfb_background_capture_and_input(self):
         import linux_bg
@@ -617,7 +680,82 @@ class TestWindowsLiveIntegration(unittest.TestCase):
         self.assertIn(b"IEND", raw_png[-16:])
 
 
-@unittest.skipUnless(sys.platform == "win32" or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"), "Requires live desktop")
+@unittest.skipUnless(sys.platform == "darwin", "macOS-only live CoreGraphics/ImageIO/AX/AppKit integration tests")
+class TestMacOSLiveIntegration(unittest.TestCase):
+    def test_macos_frameworks_windows_clipboard_imageio_orientation_a11y_overlay(self):
+        fw = macos_backend._MacFrameworks.get()
+        self.assertIsNotNone(fw.cf)
+        self.assertIsNotNone(fw.cg)
+
+        wm = macos_backend.MacWindowManager()
+        vx, vy, vw, vh = wm.virtual_bounds()
+        self.assertGreater(vw, 0)
+        self.assertGreater(vh, 0)
+        st = wm.state()
+        self.assertIn("windows", st)
+        self.assertIn("cursor", st)
+
+        # UTF-8 + emoji clipboard roundtrip (skip cleanly in headless SSH sessions without pboard)
+        cb = macos_backend.MacClipboard()
+        try:
+            prev = cb.get_text()
+            try:
+                sample = "computer-use macOS test \u00a3 \u2713 \U0001F680"
+                cb.set_text(sample)
+                self.assertEqual(cb.get_text(), sample)
+            finally:
+                try:
+                    cb.set_text(prev)
+                except Exception:
+                    pass
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+
+        # Synthetic orientation test: top half RED, bottom half BLUE -> resize + encode PNG & JPEG -> decode PNG
+        # Verifies CGBitmapContext does NOT flip the image vertically and ImageIO quality/format encode cleanly!
+        cap = macos_backend.MacScreenCapture(virtual_bounds_fn=wm.virtual_bounds)
+        arr = np.zeros((120, 240, 4), dtype=np.uint8)
+        arr[:60, :, :] = (230, 30, 30, 255)   # Top half RED
+        arr[60:, :, :] = (30, 60, 235, 255)   # Bottom half BLUE
+        frame = capture.Frame(rgba=arr, origin_x=0, origin_y=0, width=240, height=120, scale=2.0, backend="synthetic", capture_ms=0.1)
+
+        enc_jpg = cap.encode(
+            frame, max_width=160, fmt="jpeg", quality=80, grid=True, cursor=(40, 30),
+            annotations=[{"ref": 7, "bbox": (10, 10, 40, 20)}],
+        )
+        raw_jpg = base64.b64decode(enc_jpg["data_b64"])
+        self.assertTrue(raw_jpg.startswith(b"\xff\xd8\xff"))
+        self.assertTrue(raw_jpg.endswith(b"\xff\xd9"))
+
+        enc_png = cap.encode(frame, max_width=120, fmt="png")
+        raw_png = base64.b64decode(enc_png["data_b64"])
+        self.assertTrue(raw_png.startswith(b"\x89PNG"))
+        self.assertIn(b"IEND", raw_png[-16:])
+
+        decoded = cap._decode_image_bytes_to_rgba(raw_png)
+        self.assertEqual(decoded.shape[:2], (60, 120))
+        top_px = decoded[10, 60, :3]
+        bot_px = decoded[50, 60, :3]
+        self.assertGreater(int(top_px[0]), 180, f"Expected RED on top, got {top_px}")
+        self.assertGreater(int(bot_px[2]), 180, f"Expected BLUE on bottom, got {bot_px}")
+
+        # MacA11yTree non-crashing snapshot + cleanup (works whether Accessibility TCC is granted or not)
+        ax = macos_backend.MacA11yTree()
+        snap = ax.snapshot(diff=False)
+        self.assertIn("formatted", snap)
+        self.assertIn("text_lines", snap)
+        ax.close()
+
+        # AppKit cursor overlay helper spawns and shuts down cleanly without hanging or crashing
+        ov = cursor_overlay._MacAppKitOverlayProxy()
+        try:
+            if ov.ready:
+                ov.render(200.0, 200.0, 1.0, "AI", [], time.monotonic())
+        finally:
+            ov.close()
+
+
+@unittest.skipUnless(sys.platform in ("win32", "darwin") or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"), "Requires live desktop")
 class TestLiveSelftest(unittest.TestCase):
     def test_live_selftest_passes(self):
         r = subprocess.run(
@@ -626,7 +764,7 @@ class TestLiveSelftest(unittest.TestCase):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=15,
+            timeout=25,
         )
         self.assertEqual(r.returncode, 0, msg=r.stdout + "\n" + r.stderr)
         self.assertIn("ALL PASSED", r.stdout)

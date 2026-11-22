@@ -49,3 +49,23 @@ jobs:
           $env:ANTIGRAVITY_PLUGIN_DIR = $tmp
           ./install.ps1
           python -c "import json, os; d = json.load(open(os.path.join(r'$tmp', 'mcp_config.json'), encoding='utf-8')); srv = d['mcpServers']['computer-use']; assert isinstance(srv['args'], list) and len(srv['args']) == 1 and os.path.isfile(srv['args'][0]); print('install.ps1 verified OK')"
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install numpy
+        run: python3 -m pip install --upgrade pip numpy
+      - name: Run macOS CoreGraphics, ImageIO, AX, Clipboard, Overlay, and stdio protocol tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Run non-destructive macOS selftest
+        run: python3 scripts/computer_use_mcp.py --selftest
+      - name: Test install.sh installer on macOS into temporary directory
+        run: |
+          TMPDIR_PLUGIN="${RUNNER_TEMP}/agcu-macos-plugin-test"
+          ANTIGRAVITY_PLUGIN_DIR="${TMPDIR_PLUGIN}" ./install.sh
+          python3 -c 'import json, os, sys; d = json.load(open(os.path.join(sys.argv[1], "mcp_config.json"), encoding="utf-8")); srv = d["mcpServers"]["computer-use"]; assert isinstance(srv["args"], list) and len(srv["args"]) == 1 and os.path.isfile(srv["args"][0]); print("macOS install.sh verified OK")' "${TMPDIR_PLUGIN}"

@@ -521,10 +521,10 @@ class InputDriver:
                     time.sleep(0.005)
                 for i in range(max(1, int(count))):
                     self._emit_ptr([(EV_KEY, btn_code, 1)])
-                    time.sleep(0.008)
+                    time.sleep(0.004)
                     self._emit_ptr([(EV_KEY, btn_code, 0)])
                     if i + 1 < count:
-                        time.sleep(0.040)
+                        time.sleep(0.030)
             finally:
                 if pressed_mods:
                     time.sleep(0.005)
@@ -648,16 +648,16 @@ class InputDriver:
                     for c in codes[:-1]:
                         self._emit_kbd([(EV_KEY, c, 1)])
                         pressed.append(c)
-                        time.sleep(0.003)
+                        time.sleep(0.002)
                     self._emit_kbd([(EV_KEY, codes[-1], 1)])
                     pressed.append(codes[-1])
-                    time.sleep(0.008)
+                    time.sleep(0.004)
                 finally:
                     for c in reversed(pressed):
                         self._emit_kbd([(EV_KEY, c, 0)])
-                        time.sleep(0.003)
+                        time.sleep(0.002)
                 if i + 1 < count:
-                    time.sleep(0.025)
+                    time.sleep(0.015)
             return
         if shutil.which("xdotool") and os.environ.get("DISPLAY"):
             combo = to_x11_combo(keys)
@@ -671,7 +671,7 @@ class InputDriver:
         if not text:
             return
         if self._ensure_uinput():
-            delay = max(0.0015, key_delay_ms / 1000.0) if key_delay_ms > 0 else 0.0018
+            delay = max(0.0008, key_delay_ms / 1000.0) if key_delay_ms > 0 else 0.0009
             shift = KEY_CODES["shift"]
             for ch in text:
                 mapped = char_to_uinput(ch, layout=self._layout)
@@ -684,7 +684,7 @@ class InputDriver:
                     if need_shift:
                         self._emit_kbd([(EV_KEY, shift, 1)])
                         shift_down = True
-                        time.sleep(0.0012)
+                        time.sleep(0.0006)
                     self._emit_kbd([(EV_KEY, code, 1)])
                     code_down = True
                     time.sleep(delay)
@@ -692,7 +692,7 @@ class InputDriver:
                     if code_down:
                         self._emit_kbd([(EV_KEY, code, 0)])
                     if shift_down:
-                        time.sleep(0.0012)
+                        time.sleep(0.0006)
                         self._emit_kbd([(EV_KEY, shift, 0)])
             return
         if shutil.which("wtype"):

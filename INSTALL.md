@@ -4,6 +4,8 @@ Follow these exact steps to install `alexander-src/computer-use` on the user's m
 
 ## 1. Clone the repository
 
+On Linux or macOS:
+
 ```bash
 git clone https://github.com/alexander-src/computer-use.git ~/.local/share/computer-use
 cd ~/.local/share/computer-use
@@ -41,6 +43,19 @@ sudo apt-get install -y python3-gi python3-cairo python3-numpy python3-dbus gir1
 ./install.sh
 ```
 
+### macOS (Apple Silicon and Intel, macOS 13+)
+
+```bash
+./install.sh
+```
+
+`install.sh` picks Python 3.10+, installs `numpy` if missing, and uses built-in Apple frameworks (CoreGraphics, ImageIO, ApplicationServices `AXUIElement`, AppKit) with no compiler or third-party GUI libraries required. Optional faster NEON/AVX2 JPEG encoding: `brew install jpeg-turbo`.
+
+On first run, grant permissions to your terminal or Antigravity app in:
+
+1. System Settings -> Privacy & Security -> Accessibility (required for clicking, typing, and `AXUIElement` trees)
+2. System Settings -> Privacy & Security -> Screen & System Audio Recording (required for capturing other apps' windows)
+
 ### Windows 10 / 11 (PowerShell)
 
 ```powershell
@@ -51,21 +66,21 @@ No native C compiler or third-party screen-capture libraries are required on Win
 
 ## 3. Configure other MCP clients (optional)
 
-`install.sh` and `install.ps1` automatically install the full Antigravity plugin bundle into `~/.gemini/config/plugins/computer-use/` (Antigravity needs a restart to discover a new plugin directory).
+`install.sh` and `install.ps1` automatically install the full Antigravity plugin bundle into `~/.gemini/config/plugins/computer-use/` (restart Antigravity once to load a newly installed or updated MCP server).
 
-For **Claude Code**:
+For Claude Code:
 
 ```bash
 claude mcp add computer-use -- python3 ~/.gemini/config/plugins/computer-use/scripts/computer_use_mcp.py
 ```
 
-For **Codex CLI**:
+For Codex CLI:
 
 ```bash
 codex mcp add computer-use -- python3 ~/.gemini/config/plugins/computer-use/scripts/computer_use_mcp.py
 ```
 
-For **Cursor / Gemini CLI / any stdio MCP host**, add to your MCP config JSON:
+For Cursor, Gemini CLI, or any stdio MCP host, add to your MCP config JSON:
 
 ```json
 {

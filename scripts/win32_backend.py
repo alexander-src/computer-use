@@ -1197,7 +1197,7 @@ class WinScreenCapture:
         self._last_frame_rect = rect
         return res
 
-    def wait_until_settled(self, *, scope="screen", area=None, active_rect=None, max_wait_ms=160, poll_ms=25, include_cursor=False, ignore_rects_fn=None) -> Frame:
+    def wait_until_settled(self, *, scope="screen", area=None, active_rect=None, max_wait_ms=55, poll_ms=16, include_cursor=False, ignore_rects_fn=None) -> Frame:
         deadline = time.monotonic() + (max_wait_ms / 1000.0)
         prev = self.capture(scope=scope, area=area, active_rect=active_rect, include_cursor=include_cursor)
         prev_ig = ignore_rects_fn() if ignore_rects_fn else []

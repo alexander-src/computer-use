@@ -1,4 +1,4 @@
-"""Live click-through custom AI agent cursor and click ripple overlay (Linux Wayland + Windows).
+"""Live click-through custom AI agent cursor and click ripple overlay (Linux Wayland + Windows + macOS).
 
 Shows a ChatGPT-Operator-style glowing cyan pointer halo, compact status pill ("AI", "Click",
 "Type", "Drag"), and expanding animated click ripples while the agent moves and clicks,
@@ -11,6 +11,10 @@ Backends:
 - Windows 10/11: pure-ctypes WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE + WDA_EXCLUDEFROMCAPTURE floating 160x160 persistent
   per-pixel alpha DIB updated via UpdateLayeredWindow (NumPy-vectorized, 64-bit safe).
+- macOS 13/14/15/26 (Apple Silicon arm64 & Intel x86_64): dedicated main-thread AppKit
+  NSWindow helper subprocess (NSApplicationActivationPolicyAccessory, NSScreenSaverWindowLevel,
+  ignoresMouseEvents=True, NSWindowSharingNone, CanJoinAllSpaces | FullScreenAuxiliary) fed over
+  stdin JSON with immutable CFData-backed premultiplied BGRA CGImage on CALayer.contents.
 """
 
 from __future__ import annotations
@@ -18,12 +22,14 @@ from __future__ import annotations
 import array
 import atexit
 import ctypes
+import json
 import math
 import mmap
 import os
 import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -904,6 +910,387 @@ class _Win32LayeredOverlay:
 
 
 # ---------------------------------------------------------------------------
+# macOS AppKit Floating Click-Through Overlay (main-thread subprocess helper)
+# ---------------------------------------------------------------------------
+
+
+class _MacAppKitOverlayProxy:
+    """Spawn & control a dedicated main-thread AppKit NSWindow overlay subprocess on macOS.
+
+    AppKit requires NSApplication/NSWindow to live on a process's main thread; isolating it in a
+    tiny helper subprocess avoids main-thread SIGABRTs inside the stdio MCP server and degrades
+    gracefully in headless SSH / CI sessions.
+    """
+
+    SIZE = _WIN_OV_SIZE
+
+    def __init__(self) -> None:
+        self.ready = False
+        self._proc: subprocess.Popen | None = None
+        self._init()
+
+    def _init(self) -> None:
+        if sys.platform != "darwin":
+            return
+        try:
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            self._proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--mac-overlay-helper"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            if self._proc.stdout is None:
+                self.close()
+                return
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if self._proc.poll() is not None:
+                    break
+                r, _, _ = select.select([self._proc.stdout], [], [], 0.05)
+                if r:
+                    raw_line = self._proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if line == "READY":
+                        self.ready = True
+                        return
+                    if line == "HEADLESS":
+                        break
+            self.close()
+        except Exception:
+            self.close()
+
+    def _send(self, payload: dict[str, Any]) -> bool:
+        proc = self._proc
+        if not self.ready or proc is None or proc.stdin is None or proc.poll() is not None:
+            self.ready = False
+            return False
+        try:
+            proc.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            return True
+        except Exception:
+            self.ready = False
+            return False
+
+    def render(
+        self,
+        cx: float,
+        cy: float,
+        alpha: float,
+        label: str,
+        ripples: list[_Ripple],
+        now: float,
+    ) -> tuple[int, int, int, int] | None:
+        if not self.ready:
+            return None
+        if alpha <= 0.01 and not ripples:
+            self._send({"op": "hide"})
+            return None
+        win_x = int(round(cx)) - self.SIZE // 2
+        win_y = int(round(cy)) - self.SIZE // 2
+        rip_payload = [
+            [round(rp.x, 1), round(rp.y, 1), round(max(0.0, now - rp.started_at), 4), rp.color[0], rp.color[1], rp.color[2], bool(rp.double)]
+            for rp in ripples
+        ]
+        self._send({
+            "op": "render",
+            "cx": round(cx, 1),
+            "cy": round(cy, 1),
+            "win_x": win_x,
+            "win_y": win_y,
+            "alpha": round(alpha, 3),
+            "ripples": rip_payload,
+        })
+        # Also return rect so diff_frames masks the overlay even on macOS 15+ ScreenCaptureKit
+        return (win_x, win_y, self.SIZE, self.SIZE)
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self.ready = False
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    try:
+                        proc.stdin.write(b'{"op":"quit"}\n')
+                        proc.stdin.flush()
+                    except Exception:
+                        pass
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=0.5)
+                        except Exception:
+                            pass
+            finally:
+                if proc.stdout:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+
+
+def _run_mac_overlay_helper() -> int:
+    """Main-thread macOS AppKit borderless click-through cursor overlay helper process."""
+    if sys.platform != "darwin":
+        return 1
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    try:
+        from macos_backend import (
+            CGPoint,
+            CGRect,
+            CGSize,
+            _OBJC_BOOL,
+            _MacFrameworks,
+            cg_top_left_to_appkit_bottom_left,
+            kCGBitmapByteOrder32Little,
+            kCGImageAlphaPremultipliedFirst,
+        )
+        fw = _MacFrameworks.get()
+        if fw.appkit is None or int(fw.cg.CGMainDisplayID()) == 0:
+            sys.stdout.write("HEADLESS\n")
+            sys.stdout.flush()
+            return 0
+
+        # Ensure CGDataProviderCreateWithCFData signature
+        fw.cg.CGDataProviderCreateWithCFData.argtypes = [ctypes.c_void_p]
+        fw.cg.CGDataProviderCreateWithCFData.restype = ctypes.c_void_p
+
+        ns_app_cls = fw.objc.objc_getClass(b"NSApplication")
+        ns_win_cls = fw.objc.objc_getClass(b"NSWindow")
+        ns_color_cls = fw.objc.objc_getClass(b"NSColor")
+        ns_date_cls = fw.objc.objc_getClass(b"NSDate")
+        ca_layer_cls = fw.objc.objc_getClass(b"CALayer")
+        ca_tx_cls = fw.objc.objc_getClass(b"CATransaction")
+        if not (ns_app_cls and ns_win_cls and ns_color_cls and ns_date_cls and ca_layer_cls):
+            sys.stdout.write("HEADLESS\n")
+            sys.stdout.flush()
+            return 0
+
+        setup_pool = fw.objc.objc_autoreleasePoolPush()
+        try:
+            app = fw.objc_call(ns_app_cls, b"sharedApplication", ctypes.c_void_p)
+            if not app:
+                sys.stdout.write("HEADLESS\n")
+                sys.stdout.flush()
+                return 0
+            # NSApplicationActivationPolicyAccessory = 1 (zero Dock icon, zero menu hijack, zero focus steal)
+            fw.objc_call(app, b"setActivationPolicy:", _OBJC_BOOL, (ctypes.c_long, 1))
+            fw.objc_call(app, b"finishLaunching", None)
+
+            size = _WIN_OV_SIZE
+            win = fw.objc_call(ns_win_cls, b"alloc", ctypes.c_void_p)
+            init_rect = CGRect(CGPoint(0.0, 0.0), CGSize(float(size), float(size)))
+            win = fw.objc_call(
+                win,
+                b"initWithContentRect:styleMask:backing:defer:",
+                ctypes.c_void_p,
+                (CGRect, init_rect),
+                (ctypes.c_uint64, 0),  # NSWindowStyleMaskBorderless
+                (ctypes.c_uint64, 2),  # NSBackingStoreBuffered
+                (_OBJC_BOOL, False),
+            )
+            if not win:
+                sys.stdout.write("HEADLESS\n")
+                sys.stdout.flush()
+                return 0
+
+            clear_col = fw.objc_call(ns_color_cls, b"clearColor", ctypes.c_void_p)
+            fw.objc_call(win, b"setLevel:", None, (ctypes.c_long, 1000))  # NSScreenSaverWindowLevel
+            fw.objc_call(win, b"setOpaque:", None, (_OBJC_BOOL, False))
+            fw.objc_call(win, b"setBackgroundColor:", None, (ctypes.c_void_p, clear_col))
+            fw.objc_call(win, b"setHasShadow:", None, (_OBJC_BOOL, False))
+            fw.objc_call(win, b"setIgnoresMouseEvents:", None, (_OBJC_BOOL, True))
+            fw.objc_call(win, b"setSharingType:", None, (ctypes.c_uint64, 0))  # NSWindowSharingNone
+            # CanJoinAllSpaces(1) | Stationary(16) | IgnoresCycle(64) | FullScreenAuxiliary(256)
+            fw.objc_call(win, b"setCollectionBehavior:", None, (ctypes.c_uint64, 1 | 16 | 64 | 256))
+
+            # Layer-hosting view: setLayer: FIRST, then setWantsLayer:YES so AppKit never clears contents
+            content_view = fw.objc_call(win, b"contentView", ctypes.c_void_p)
+            layer = fw.objc_call(ca_layer_cls, b"layer", ctypes.c_void_p)
+            if not (content_view and layer):
+                sys.stdout.write("HEADLESS\n")
+                sys.stdout.flush()
+                return 0
+            fw.objc_call(content_view, b"setLayer:", None, (ctypes.c_void_p, layer))
+            fw.objc_call(content_view, b"setWantsLayer:", None, (_OBJC_BOOL, True))
+        finally:
+            fw.objc.objc_autoreleasePoolPop(setup_pool)
+
+        cs = fw.cg.CGColorSpaceCreateDeviceRGB()
+        if not cs:
+            sys.stdout.write("HEADLESS\n")
+            sys.stdout.flush()
+            return 0
+        default_mode = fw.cf_runloop_default_mode
+
+        cmd_lock = threading.Lock()
+        latest_cmd: list[dict[str, Any] | None] = [None]
+        stop_flag = threading.Event()
+
+        def reader() -> None:
+            try:
+                for raw in sys.stdin:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue
+                    if msg.get("op") == "quit":
+                        stop_flag.set()
+                        return
+                    with cmd_lock:
+                        latest_cmd[0] = msg
+            finally:
+                stop_flag.set()
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
+
+        arr = np.zeros((size, size, 4), dtype=np.uint8)
+        visible = False
+
+        try:
+            while not stop_flag.is_set():
+                pool = fw.objc.objc_autoreleasePoolPush()
+                try:
+                    with cmd_lock:
+                        msg = latest_cmd[0]
+                        latest_cmd[0] = None
+
+                    if msg is not None:
+                        op = msg.get("op")
+                        if op == "hide":
+                            if visible:
+                                fw.objc_call(win, b"orderOut:", None, (ctypes.c_void_p, None))
+                                visible = False
+                        elif op == "render":
+                            now_local = time.monotonic()
+                            rips = [
+                                _Ripple(
+                                    x=float(r[0]),
+                                    y=float(r[1]),
+                                    started_at=now_local - float(r[2]),
+                                    color=(float(r[3]), float(r[4]), float(r[5])),
+                                    double=bool(r[6]),
+                                )
+                                for r in (msg.get("ripples") or [])
+                            ]
+                            win_x = int(msg["win_x"])
+                            win_y = int(msg["win_y"])
+                            _draw_win32_argb_buffer(
+                                arr,
+                                size,
+                                cx=float(msg["cx"]),
+                                cy=float(msg["cy"]),
+                                win_x=win_x,
+                                win_y=win_y,
+                                alpha=float(msg["alpha"]),
+                                ripples=rips,
+                                now=now_local,
+                            )
+                            cf_data = fw.cf.CFDataCreate(None, arr.ctypes.data, arr.nbytes)
+                            if cf_data:
+                                try:
+                                    prov = fw.cg.CGDataProviderCreateWithCFData(cf_data)
+                                    if prov:
+                                        try:
+                                            cg_img = fw.cg.CGImageCreate(
+                                                size, size, 8, 32, size * 4, cs,
+                                                kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+                                                prov, None, False, 0,
+                                            )
+                                            if cg_img:
+                                                try:
+                                                    if ca_tx_cls:
+                                                        fw.objc_call(ca_tx_cls, b"begin", None)
+                                                        fw.objc_call(ca_tx_cls, b"setDisableActions:", None, (_OBJC_BOOL, True))
+                                                    fw.objc_call(layer, b"setContents:", None, (ctypes.c_void_p, cg_img))
+                                                    if ca_tx_cls:
+                                                        fw.objc_call(ca_tx_cls, b"commit", None)
+                                                        fw.objc_call(ca_tx_cls, b"flush", None)
+                                                finally:
+                                                    fw.cg.CGImageRelease(cg_img)
+                                        finally:
+                                            fw.cg.CGDataProviderRelease(prov)
+                                finally:
+                                    fw.cf.CFRelease(cf_data)
+
+                            prim_h = float(fw.cg.CGDisplayBounds(fw.cg.CGMainDisplayID()).size.height) or 900.0
+                            ns_x, ns_y = cg_top_left_to_appkit_bottom_left(win_x, win_y, size, prim_h)
+                            fw.objc_call(win, b"setFrameOrigin:", None, (CGPoint, CGPoint(ns_x, ns_y)))
+                            if not visible:
+                                fw.objc_call(win, b"orderFrontRegardless", None)
+                                visible = True
+
+                    # Real AppKit NSEvent pump (sleeps cleanly until dt without 100% CPU busy spin)
+                    dt = 0.011 if visible else 0.030
+                    until = fw.objc_call(ns_date_cls, b"dateWithTimeIntervalSinceNow:", ctypes.c_void_p, (ctypes.c_double, dt))
+                    ev = fw.objc_call(
+                        app,
+                        b"nextEventMatchingMask:untilDate:inMode:dequeue:",
+                        ctypes.c_void_p,
+                        (ctypes.c_uint64, 0xFFFFFFFFFFFFFFFF),
+                        (ctypes.c_void_p, until),
+                        (ctypes.c_void_p, default_mode),
+                        (_OBJC_BOOL, True),
+                    )
+                    while ev:
+                        fw.objc_call(app, b"sendEvent:", None, (ctypes.c_void_p, ev))
+                        ev = fw.objc_call(
+                            app,
+                            b"nextEventMatchingMask:untilDate:inMode:dequeue:",
+                            ctypes.c_void_p,
+                            (ctypes.c_uint64, 0xFFFFFFFFFFFFFFFF),
+                            (ctypes.c_void_p, None),
+                            (ctypes.c_void_p, default_mode),
+                            (_OBJC_BOOL, True),
+                        )
+                finally:
+                    fw.objc.objc_autoreleasePoolPop(pool)
+        finally:
+            teardown_pool = fw.objc.objc_autoreleasePoolPush()
+            try:
+                fw.objc_call(win, b"orderOut:", None, (ctypes.c_void_p, None))
+                fw.objc_call(win, b"close", None)
+            except Exception:
+                pass
+            finally:
+                fw.objc.objc_autoreleasePoolPop(teardown_pool)
+            fw.cg.CGColorSpaceRelease(cs)
+        return 0
+    except Exception:
+        try:
+            sys.stdout.write("HEADLESS\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Unified non-blocking CursorOverlay controller
 # ---------------------------------------------------------------------------
 
@@ -942,7 +1329,7 @@ class CursorOverlay:
     def _ensure_started(self) -> None:
         if not self._enabled or self._thread is not None:
             return
-        if sys.platform != "win32" and not os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
+        if sys.platform not in ("win32", "darwin") and not os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
             self._backend_name = "headless"
             return
         self._stop.clear()
@@ -1007,6 +1394,13 @@ class CursorOverlay:
                 return b
             self._backend_name = "unavailable"
             return None
+        if sys.platform == "darwin":
+            b = _MacAppKitOverlayProxy()
+            if b.ready:
+                self._backend_name = "macos-appkit-overlay"
+                return b
+            self._backend_name = "unavailable"
+            return None
         if os.environ.get("WAYLAND_DISPLAY"):
             b = _WaylandLayerOverlay()
             if b.ready:
@@ -1056,3 +1450,8 @@ class CursorOverlay:
                     self._wake.clear()
         finally:
             backend.close()
+
+
+if __name__ == "__main__":
+    if "--mac-overlay-helper" in sys.argv:
+        sys.exit(_run_mac_overlay_helper())
