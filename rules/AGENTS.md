@@ -7,14 +7,14 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
 - `desktop_act` (batched local execution, 0.05 ms with `observe: "none"`, non-blocking 120Hz cyan AI cursor + ripples, preserves user physical mouse):
   - `{steps: [{op, ...}, ...], background?: false, fast?: false, smooth?: true, independent_cursor?: true, settle?: "none"|"smart"|ms, observe?: "auto"|"ax"|"ocr"|"vision"|"crop_changed"|"none", verify_change?: false, detect_takeover?: false, screenshot?, annotate?, grid?, max_width?: 896, quality?: 62}` (or single-step shorthand `{op: "click", text: "Save"}`).
   - Moving the user's mouse never aborts by default. The AI glides its own cyan overlay cursor asynchronously at 120Hz (zero sleep on the action path) and restores the user's physical cursor immediately after clicking.
-  - Text targets (`text`, `text_target`, `target`) resolve locally via AX/UIA/AXUIElement first, then pre-warmed 8-thread `tessdata_fast` OCR with local dark/light tile normalization (reads both dark apps and white modals on the same screen) and ~22 ms popup-diff cropping inside `wait_and_click`. Pass `offset_x` / `offset_y` to click an input box below a label (e.g. `offset_y: 28`) or an icon beside a header (e.g. `offset_x: 110`).
+  - Text targets (`text`, `text_target`, `target`) resolve locally via AX/UIA/AXUIElement first, then pre-warmed 8-thread `tessdata_fast` OCR with 4x local dark/light/button polarity normalization (reads dark apps, white modals, and colored buttons on the same screen) and ~15 to 35 ms diff-cropping inside both `wait_and_click` and `wait(text=...)`. Pass `offset_x` / `offset_y` to click an input box below a label (e.g. `offset_y: 28`) or an icon beside a header (e.g. `offset_x: 110`).
   - Compound ops (collapse multi-dialog flows into 1 tool call):
     - `launch`: `{command, wait_app?, timeout_ms?}` (focuses an already-open matching window in ~1.5 ms, or launches and waits for the matching window automatically)
     - `open_url`: `{url, app?, new_tab?: false, submit?: true}` (focuses/launches browser, sends `ctrl+l`/`cmd+l` or `ctrl+t`/`cmd+t`, pastes URL, presses Enter)
-    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 25, area?, offset_x?, offset_y?, retry_prev?: true, button?, count?, double?, clear?, type_text?, submit?}` (diffs against the pre-click frame, OCRs only the changed modal in ~22 ms, auto-retries a swallowed preceding click once after 420 ms if nothing changed, and clicks as soon as text appears)
+    - `wait_and_click`: `{text, timeout_ms?: 2500, poll_ms?: 20, area?, offset_x?, offset_y?, retry_prev?: true, button?, count?, double?, clear?, type_text?, submit?}` (diffs against the pre-click frame so it never matches stale text, OCRs only the changed modal in ~15 to 35 ms, skips OCR on unchanged frames, auto-retries a swallowed preceding click once after 420 ms, and clicks as soon as text appears)
     - `click_and_type`: `{ref|target|text_target|x,y|nx,ny, offset_x?, offset_y?, text|value, clear?: false, submit?: false, mode?: "auto"|"paste"|"keys"}`
     - `keys`: `{sequence: ["ctrl+t", "tab", "enter"], delay_ms?: 10}` (rapid keyboard macro burst)
-    - `repeat`: `{count: 5, steps: [...], delay_ms?: 8}` (local loop, zero extra LLM turns)
+    - `repeat`: `{count: 5, steps: [...], delay_ms?: 8}` (local loop with automatic pre-step diff snapshots, zero extra LLM turns)
   - Core ops:
     - `click`: `{ref|text|x,y|nx,ny, offset_x?, offset_y?, coord_scope?, button?: "left"|"right"|"middle", count?: 1|2|3, double?, modifiers?: ["ctrl","shift","alt","super","cmd"]}`
     - `move` / `hover`: `{ref|text|x,y|nx,ny, coord_scope?}`
@@ -25,7 +25,7 @@ Use MCP server `computer-use_computer-use` via `call_mcp_tool` whenever the user
     - `ax_action`: `{ref, action_name?}` (mouse-free AT-SPI2 / Windows UIA / macOS `AXPress`)
     - `focus`: `{window_id?|app?|title?}`
     - `window`: `{window_action: "focus"|"minimize"|"maximize"|"unmaximize"|"close"|"move_resize", window_id?|app?|title?, x?, y?, w?, h?}`
-    - `wait`: `{ms?|change?: true, area?, threshold_pct?, text?|gone?|app?, timeout_ms?}` (polls AX + local OCR for `text` to appear or `gone` to disappear, or exits immediately on pixel `change`)
+    - `wait`: `{ms?|change?: true, area?, threshold_pct?, text?|gone?|app?, timeout_ms?}` (`wait(text=...)` shares pre-click diff-cropping so it never matches stale text; `wait(gone=...)` locks onto the target text's bounding box and polls pixel diff at 0.25 ms + 4.5 ms tiny-crop verify; `wait(change=true)` exits immediately on pixel change)
     - `screenshot`: `{scope?, area?, ref?, annotate?, grid?, max_width?, quality?}`
 - `desktop_observe` (1-call state: windows + AX `[ref]` tree + automatic inline `OCR_TEXT` `[x,y]` labels on sparse-AX apps with zero image offload; falls back to compact `896px` JPEG only if OCR finds <5 words or `mode: "vision"` / `screenshot: true` is passed):
   - `{mode?: "hybrid"|"ax"|"ocr"|"vision"|"windows", background?: false, ocr?: false, find?, diff?: "auto"|true|false, screenshot?: "auto"|true|false, scope?: "screen"|"active", annotate?, grid?, max_elements?, max_width?: 896, quality?: 62}`

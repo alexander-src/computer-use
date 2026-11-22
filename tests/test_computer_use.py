@@ -756,6 +756,145 @@ class TestEngineAndProtocol(unittest.TestCase):
         mtimes = mcp.MCPServer._script_mtimes()
         self.assertIn("computer_use_mcp.py", mtimes)
 
+    def test_wait_text_diff_crop_prevents_stale_preclick_match(self):
+        # Regression test for Discord "Create Role" -> wait(text="Permissions"):
+        # Pre-click page has stale "Default permissions"; must NOT match while screen hasn't painted,
+        # and once new pane paints (<72% of window), must OCR ONLY the changed crop!
+        w, h = 1000, 700
+        old_arr = np.full((h, w, 4), 40, dtype=np.uint8)
+        old_arr[:, :, 3] = 255
+        new_arr = old_arr.copy()
+        new_arr[120:460, 520:920, :3] = 220  # Newly painted right pane (~19% of window)
+
+        class SeqCapture:
+            backend = "kwin-sim"
+            diff_frames = capture.ScreenCapture.diff_frames
+
+            def __init__(self):
+                self._last_frame = None
+                self.calls = 0
+
+            def capture(self, scope="screen", area=None, window_id=None, active_rect=None, include_cursor=True):
+                self.calls += 1
+                # Call 1 = pre-step snapshot (old), calls 2-3 = still painting (old), call 4+ = painted (new)
+                arr = old_arr if self.calls <= 3 else new_arr
+                if area is not None:
+                    ax, ay, aw, ah = area
+                    sub = arr[ay:ay + ah, ax:ax + aw, :].copy()
+                    return capture.Frame(sub, ax, ay, sub.shape[1], sub.shape[0], 1.0, "kwin-sim", 0.5)
+                return capture.Frame(arr.copy(), 0, 0, w, h, 1.0, "kwin-sim", 0.5)
+
+        class TrackingOCR:
+            available = True
+            backend_name = "mock-track"
+
+            def __init__(self):
+                self.scanned_sizes: list[tuple[int, int]] = []
+
+            def scan_frame(self, frame, *, min_conf=35.0):
+                self.scanned_sizes.append((frame.width, frame.height))
+                # If scanning full old frame -> would falsely return stale "Permissions" at (888, 651)
+                if frame.width == w and frame.height == h:
+                    return [{"text": "Permissions", "x": 850, "y": 640, "w": 76, "h": 22, "conf": 95.0}]
+                # Cropped newly painted right pane -> returns NEW "Permissions" tab at (720, 250)
+                return [{"text": "Permissions", "x": 680, "y": 240, "w": 80, "h": 20, "conf": 96.0}]
+
+            def find_text(self, frame, query):
+                return fast_ocr.match_ocr_phrase(self.scan_frame(frame), query)
+
+            def close(self):
+                pass
+
+        cap = SeqCapture()
+        t_ocr = TrackingOCR()
+        eng, *_ = self._make_engine(elements=[], ocr=t_ocr)
+        eng.capture = cap
+        eng.windows._active.update({"x": 0, "y": 0, "w": w, "h": h})
+
+        blocks = eng.tool_act({
+            "observe": "none",
+            "steps": [
+                {"op": "click", "x": 600, "y": 300, "smooth": False},
+                {"op": "wait", "text": "Permissions", "poll_ms": 18, "timeout_ms": 1500},
+            ],
+        })
+        txt = blocks[0]["text"]
+        self.assertIn("2/2 ok", txt)
+        self.assertIn("ocr-popup(exact)", txt)
+        self.assertIn("[720,250]", txt)
+        # Must NEVER have scanned the full 1000x700 old frame!
+        self.assertEqual(len(t_ocr.scanned_sizes), 1)
+        self.assertLess(t_ocr.scanned_sizes[0][0], w)
+        self.assertLess(t_ocr.scanned_sizes[0][1], h)
+
+    def test_wait_gone_bbox_lock_and_pixel_diff_gate(self):
+        # Verify wait(gone=...) locks onto the text's tight bbox, skips OCR while unchanged,
+        # and verifies disappearance with a single tiny-crop OCR when pixels change!
+        w, h = 1000, 700
+        open_arr = np.full((h, w, 4), 40, dtype=np.uint8)
+        open_arr[:, :, 3] = 255
+        open_arr[300:328, 400:540, :3] = 230  # Modal button text region
+        closed_arr = np.full((h, w, 4), 40, dtype=np.uint8)
+        closed_arr[:, :, 3] = 255
+
+        class GoneCapture:
+            backend = "kwin-sim"
+            diff_frames = capture.ScreenCapture.diff_frames
+
+            def __init__(self):
+                self._last_frame = None
+                self.area_calls: list[tuple[int, int, int, int] | None] = []
+
+            def capture(self, scope="screen", area=None, window_id=None, active_rect=None, include_cursor=True):
+                self.area_calls.append(area)
+                # Calls 1-3: modal open; Call 4+: modal closed!
+                arr = open_arr if len(self.area_calls) <= 3 else closed_arr
+                if area is not None:
+                    ax, ay, aw, ah = area
+                    sub = arr[ay:ay + ah, ax:ax + aw, :].copy()
+                    return capture.Frame(sub, ax, ay, sub.shape[1], sub.shape[0], 1.0, "kwin-sim", 0.2)
+                return capture.Frame(arr.copy(), 0, 0, w, h, 1.0, "kwin-sim", 0.2)
+
+        class GoneOCR:
+            available = True
+            backend_name = "mock-gone"
+
+            def __init__(self):
+                self.scans: list[tuple[int, int]] = []
+
+            def scan_frame(self, frame, *, min_conf=35.0):
+                self.scans.append((frame.width, frame.height))
+                # If bright button pixels are present, return "Create Channel"; otherwise empty!
+                if int((frame.rgba[:, :, 1] > 180).sum()) > 50:
+                    return [
+                        {"text": "Create", "x": 400, "y": 300, "w": 64, "h": 28, "conf": 96.0},
+                        {"text": "Channel", "x": 470, "y": 300, "w": 70, "h": 28, "conf": 95.0},
+                    ]
+                return []
+
+            def find_text(self, frame, query):
+                return fast_ocr.match_ocr_phrase(self.scan_frame(frame), query)
+
+            def close(self):
+                pass
+
+        cap = GoneCapture()
+        g_ocr = GoneOCR()
+        eng, *_ = self._make_engine(elements=[], ocr=g_ocr)
+        eng.capture = cap
+        eng.windows._active.update({"x": 0, "y": 0, "w": w, "h": h})
+
+        blocks = eng.tool_act({
+            "observe": "none",
+            "steps": [{"op": "wait", "gone": "Create Channel", "timeout_ms": 1500}],
+        })
+        self.assertIn('"gone":true', blocks[0]["text"])
+        # Exactly 2 OCR scans total: initial active-window locate + 1 tiny-crop verify (0 OCR while unchanged!)
+        self.assertEqual(len(g_ocr.scans), 2)
+        self.assertEqual(g_ocr.scans[0], (w, h))
+        self.assertLess(g_ocr.scans[1][0], 250)
+        self.assertLess(g_ocr.scans[1][1], 120)
+
     def test_cursor_overlay_glide_to_is_non_blocking(self):
         # Even with a long 250ms glide animation, glide_to() must return in <10ms (async on overlay thread)
         ov = cursor_overlay.CursorOverlay()
@@ -829,6 +968,18 @@ class TestEngineAndProtocol(unittest.TestCase):
             self.assertLess((time.perf_counter() - t0) * 1000.0, 5.0)
         finally:
             ocr.close()
+
+        # Also verify memfd+mmap isolated OMP_THREAD_LIMIT=1 helper worker works cleanly with zero leaks
+        if hasattr(os, "memfd_create"):
+            iso = fast_ocr._IsolatedOCRClient(workers=4)
+            try:
+                self.assertTrue(iso.start())
+                ws = iso.scan_gray(np.ascontiguousarray(rgba[:, :, 1]), 200, 100, 1.0, 35.0)
+                self.assertIsNotNone(ws)
+                hit_iso = fast_ocr.match_ocr_phrase(ws, "Create My Own")
+                self.assertIsNotNone(hit_iso)
+            finally:
+                iso.close()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("Xvfb"), "Requires Linux with Xvfb")

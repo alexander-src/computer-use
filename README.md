@@ -34,10 +34,10 @@ Both installers set up the Antigravity plugin bundle (`~/.gemini/config/plugins/
 
 ## Reducing Both Local Overhead and LLM Round-Trips
 
-End-to-end speed in a desktop agent depends mostly on how many cloud LLM turns a task takes, not just raw millisecond timings. `computer-use` v2.5 cuts both:
+End-to-end speed in a desktop agent depends on both local action overhead and cloud LLM turns. `computer-use` v2.6 cuts both:
 
-- Inline pre-warmed `tessdata_fast` OCR (`OMP_THREAD_LIMIT=1` set before `numpy`/`libgomp` load to prevent OpenMP thread thrashing) replaces double-turn image offloads: on apps with empty accessibility trees (Discord, Brave, Chrome, Electron, VS Code, Spotify), `desktop_observe()` and `desktop_act(observe="auto")` run 8-thread in-process `libtesseract` with smooth local dark/white/colored-button polarity normalization and return clickable `[x,y] "Label"` coordinates inline plus a 1 ms `SCREENSHOT_PATH` grid JPEG for textless icons.
-- Self-healing closed-loop compound ops collapse multi-dialog flows into one call: `launch` (focuses an already-open window in ~1.5 ms or waits for the matching window), `open_url`, `wait_and_click` (diffs against the pre-click frame, OCRs only the newly opened modal in ~21 to 32 ms, auto-retries a swallowed preceding click once after 420 ms if nothing changed, supports `offset_x`/`offset_y`), `click_and_type`, `keys`, `repeat`, `wait(gone="...")` (exits the millisecond a submitted modal closes), and `wait(change=true)`.
+- Inline pre-warmed `tessdata_fast` OCR (`OMP_THREAD_LIMIT=1` in-process, or an automatic `memfd` + `mmap` isolated `OMP_THREAD_LIMIT=1` helper when hot-reloading an existing Linux host process) replaces double-turn image offloads: on apps with empty accessibility trees (Discord, Brave, Chrome, Electron, VS Code, Spotify), `desktop_observe()` and `desktop_act(observe="auto")` run 8-thread `libtesseract` (`load_system_dawg=0`, blank-strip skip, silenced Leptonica stderr, 4x local dark/white/colored-button polarity normalization) and return clickable `[x,y] "Label"` coordinates inline plus a 1 ms `SCREENSHOT_PATH` grid JPEG for textless icons.
+- Diff-cropped `wait_and_click` and `wait(text=...)` plus bbox-locked `wait(gone=...)` collapse multi-dialog flows into one call: `launch` (focuses an already-open window in ~1.5 ms or waits for the matching window), `open_url`, `wait_and_click` and `wait(text=...)` (wait for post-click pixels to paint so they never match stale text on the previous screen, OCR only the newly changed popup/pane in ~14 to 45 ms, skip OCR on unchanged frames, auto-retry a swallowed click once after 420 ms, support `offset_x`/`offset_y`), `click_and_type`, `keys`, `repeat`, `wait(gone="...")` (locks onto the target text's bounding box, polls pixel diff at ~0.25 ms, and confirms disappearance with a ~4.5 ms tiny crop instead of re-scanning the full screen), and `wait(change=true)`.
 - Pre-warmed `/dev/uinput` + non-blocking 120Hz cursor glide + smart post-submit settle: eliminates the 200 ms first-input uinput setup delay and 400 ms first-OCR init delay at server boot, animates the cyan AI cursor on a background thread (`0.008 ms` on the action path), and waits for dialog transitions after `wait_and_click`/`submit` so post-action OCR sees the updated screen instead of a stale closing modal.
 
 Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python3 scripts/computer_use_mcp.py --bench` and tool profiling:
@@ -50,8 +50,9 @@ Measured live on Arch Linux with KDE Plasma 6 (Wayland, `1920x1080`) via `python
 | `desktop_observe(mode="hybrid")` (visual) | KWin DBus + sparse AX cache + `896px` grid | 8.45 ms | 47 KB base64 payload |
 | `400x300` region capture | `org.kde.KWin.ScreenShot2` FD pipe | 0.25 ms | Sub-millisecond crop |
 | Full `1920x1080` capture + `896px` JPEG (`q=62`) | `KWin.ScreenShot2` + Cairo + AVX2 `libturbojpeg` | 4.54 ms | 41 KB (50 KB with grid) |
-| Modal popup `450x550` local OCR (`wait_and_click`) | Pre-warmed 8-thread `tessdata_fast` + diff crop | 21 to 32 ms | Mixed dark/light tile normalization |
-| Dense `1493x888` app window local OCR (326 words) | Pre-warmed 8-thread `tessdata_fast` | 122.7 ms | Down from 790 ms on distro `tessdata_best` |
+| Tiny `220x60` `wait(gone)` bbox verify | Pre-warmed `tessdata_fast` + pixel-diff gate | 4.5 ms | 0.25 ms/poll while unchanged |
+| Modal popup `440x520` local OCR (`wait_and_click` / `wait`) | Pre-warmed 8-thread `tessdata_fast` + diff crop | 14 to 45 ms | Mixed dark/light/button normalization |
+| Full `1920x1080` local OCR | Pre-warmed 8-thread `tessdata_fast` (`no_dawg`) | 108 to 161 ms | Was 790 ms (`tessdata_best`) or 1,800 ms without OMP limit |
 | Window list + active window + cursor | `org.kde.KWin /Scripting` DBus | 1.23 ms | 1.15 ms min |
 | Clipboard read | `org.kde.klipper` DBus | 0.03 ms | Async restore saves ~110 ms/paste |
 | Private background capture (`800x600`) | Authenticated `Xvfb` + direct `libX11` | 1.91 ms | Zero interference with live session |

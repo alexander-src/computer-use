@@ -27,11 +27,14 @@ import importlib
 import json
 import math
 import os
-# Must be set BEFORE importing numpy/libgomp/libtesseract to prevent 16-thread OpenMP thrashing across 8 OCR workers (~5x faster OCR)
-os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+import sys
+# Must be set BEFORE importing numpy/libgomp/libtesseract to prevent 16-thread OpenMP thrashing across 8 OCR workers (~5-16x faster OCR)
+if "numpy" not in sys.modules and "fast_ocr" not in sys.modules:
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    if os.environ.get("OMP_THREAD_LIMIT") == "1":
+        os.environ["_AGCU_OMP_CLEAN"] = "1"
 import platform
 import statistics
-import sys
 import tempfile
 import threading
 import time
@@ -46,7 +49,7 @@ from cursor_overlay import CursorOverlay
 from fast_ocr import FastOCR, format_ocr_compact
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.5.0"
+SERVER_VERSION = "2.6.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -193,6 +196,7 @@ class DesktopEngine:
         self.last_image_rect: tuple[int, int, int, int] | None = None
         self.last_bg_image_rect: tuple[int, int, int, int] | None = None
         self._pre_step_frame: Frame | None = None
+        self._last_wait_frame: Frame | None = None
         self._prev_click: tuple[int, int, str] | None = None
         self._ai_cursor_pos: tuple[float, float] | None = None
         self._clip_restore_gen = 0
@@ -429,7 +433,7 @@ class DesktopEngine:
                 return True
             if op in ("type", "click_and_type", "wait_and_click", "screenshot"):
                 return True
-            if op == "wait" and st.get("text"):
+            if op == "wait" and (st.get("text") or st.get("gone")):
                 return True
             if st.get("text_target") or st.get("target") or (op != "type" and st.get("text")):
                 return True
@@ -712,7 +716,7 @@ class DesktopEngine:
                 "windows": self.windows.backend,
                 "clipboard": self.clipboard.backend,
                 "a11y": a11y_label if self.a11y.available else "unavailable",
-                "ocr": "libtesseract-parallel" if self.ocr.available else "unavailable",
+                "ocr": getattr(self.ocr, "backend_name", "libtesseract-parallel" if self.ocr.available else "unavailable"),
                 "cursor_overlay": self.overlay.backend,
                 "background": self.background.status(),
             },
@@ -1048,6 +1052,231 @@ class DesktopEngine:
             content.append({"type": "text", "text": "\n".join(lines)})
         return content
 
+    def _snapshot_pre_step(self, active_win: dict[str, Any] | None) -> None:
+        """Snapshot the active window (~2 ms) before a click/key so follow-up wait ops diff-crop only the new popup."""
+        if self.capture.backend == "unavailable":
+            self._pre_step_frame = None
+            return
+        try:
+            if active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
+                self._pre_step_frame = self.capture.capture(
+                    scope="area",
+                    area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
+                    include_cursor=False,
+                )
+            else:
+                self._pre_step_frame = self.capture.capture(scope="screen", include_cursor=False)
+        except Exception:
+            self._pre_step_frame = None
+
+    def _capture_wait_frame(
+        self,
+        active_win: dict[str, Any] | None,
+        *,
+        area: tuple[int, int, int, int] | None = None,
+        pre_frame: Frame | None = None,
+    ) -> Frame:
+        if area is not None:
+            return self.capture.capture(scope="area", area=area, include_cursor=False)
+        if pre_frame is not None:
+            return self.capture.capture(
+                scope="area",
+                area=(pre_frame.origin_x, pre_frame.origin_y, pre_frame.logical_width, pre_frame.logical_height),
+                include_cursor=False,
+            )
+        if active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
+            return self.capture.capture(
+                scope="area",
+                area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
+                include_cursor=False,
+            )
+        return self.capture.capture(scope="screen", include_cursor=False)
+
+    def _wait_for_text_fast(
+        self,
+        query: str,
+        active_win: dict[str, Any] | None,
+        *,
+        area: tuple[int, int, int, int] | None = None,
+        timeout_ms: int = 2500,
+        poll_s: float = 0.020,
+        allow_ocr: bool = True,
+        retry_prev_ok: bool = False,
+        independent_cursor: bool = True,
+        _depth: int = 0,
+    ) -> tuple[tuple[int, int, str] | None, Frame | None]:
+        """Shared diff-cropped + unchanged-frame-gated text waiter for wait_and_click and wait(text=...).
+
+        When a preceding click/key captured `self._pre_step_frame`:
+        - Skips OCR while pixels have not painted yet (<0.18% diff during the first 240 ms), preventing
+          stale pre-click text matches on the old page (e.g. matching old 'Default permissions' before
+          a newly opened role editor paints!).
+        - Diff-crops and OCRs ONLY the newly painted popup/pane (~15-45 ms instead of full window).
+        - Skips redundant full-window OCR polls whenever the frame hasn't changed since the previous scan.
+        """
+        t_start = time.monotonic()
+        deadline = t_start + timeout_ms / 1000.0
+        pre_frame = self._pre_step_frame
+        last_cur_frame: Frame | None = None
+        last_crop_frame: Frame | None = None
+        last_full_frame: Frame | None = None
+        retried_prev = False
+        found: tuple[int, int, str] | None = None
+        paint_wait_s = min(0.24, (timeout_ms / 1000.0) * 0.35)
+
+        while True:
+            # Fast path 1: AX cache/tree (instant on native apps)
+            found = self._find_text_point(query, active_win, area=area, allow_ocr=False)
+            if found is not None:
+                break
+
+            if allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
+                cur_frame = self._capture_wait_frame(active_win, area=area, pre_frame=pre_frame)
+                last_cur_frame = cur_frame
+                elapsed = time.monotonic() - t_start
+                is_mock = (cur_frame.backend == "mock")
+                has_pre = (
+                    pre_frame is not None
+                    and area is None
+                    and not is_mock
+                    and cur_frame.width == pre_frame.width
+                    and cur_frame.height == pre_frame.height
+                )
+
+                used_crop = False
+                waiting_for_paint = False
+                if has_pre:
+                    assert pre_frame is not None
+                    d = self.capture.diff_frames(pre_frame, cur_frame, ignore_rects=self._overlay_ignore_rects())
+                    bbox = d.get("changed_bbox")
+                    if d["changed_pct"] >= 0.18 and bbox:
+                        bw, bh = bbox[2], bbox[3]
+                        if (bw * bh) < (cur_frame.logical_width * cur_frame.logical_height * 0.72):
+                            used_crop = True
+                            crop_changed = True
+                            if last_crop_frame is not None and last_crop_frame.width == cur_frame.width and last_crop_frame.height == cur_frame.height:
+                                dc = self.capture.diff_frames(last_crop_frame, cur_frame, ignore_rects=self._overlay_ignore_rects())
+                                crop_changed = dc["changed_pct"] >= 0.08
+                            if crop_changed:
+                                last_crop_frame = cur_frame
+                                crop = self._crop_frame_logical(cur_frame, bbox, pad=36)
+                                hit = self.ocr.find_text(crop, query)
+                                if hit is not None:
+                                    found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-popup({hit['match_type']})")
+                                    break
+                    elif elapsed < paint_wait_s:
+                        # Screen hasn't painted the post-click transition yet; skip OCR completely
+                        waiting_for_paint = True
+                    elif (
+                        retry_prev_ok
+                        and not retried_prev
+                        and self._prev_click is not None
+                        and elapsed >= 0.42
+                    ):
+                        # Preceding click was likely swallowed by a closing modal animation; retry it ONCE
+                        rx, ry, rbtn = self._prev_click
+                        retried_prev = True
+                        self._exec_step(
+                            "click", {"op": "click", "x": rx, "y": ry, "button": rbtn}, active_win,
+                            smooth=False, independent_cursor=independent_cursor, _depth=_depth + 1,
+                        )
+                        waiting_for_paint = True
+
+                # Full active-window scan only when not waiting for paint, and gated by frame-change diff
+                allow_full = (not waiting_for_paint) and (not used_crop or elapsed >= paint_wait_s)
+                if allow_full:
+                    need_scan = True
+                    if (
+                        not is_mock
+                        and last_full_frame is not None
+                        and last_full_frame.width == cur_frame.width
+                        and last_full_frame.height == cur_frame.height
+                    ):
+                        df = self.capture.diff_frames(last_full_frame, cur_frame, ignore_rects=self._overlay_ignore_rects())
+                        need_scan = df["changed_pct"] >= 0.10
+                    if need_scan:
+                        last_full_frame = cur_frame
+                        hit = self.ocr.find_text(cur_frame, query)
+                        if hit is not None:
+                            found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})")
+                            break
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(poll_s)
+
+        if found is None and area is None and allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
+            # Final full-screen fallback in case a dialog opened outside active_win bounds
+            vx, vy, vw, vh = self._virtual_bounds()
+            was_smaller = last_cur_frame is None or (last_cur_frame.logical_width < vw * 0.95 or last_cur_frame.logical_height < vh * 0.95)
+            if was_smaller:
+                full_f = self.capture.capture(scope="screen", include_cursor=False)
+                hit = self.ocr.find_text(full_f, query)
+                if hit is not None:
+                    found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-screen({hit['match_type']})")
+                    last_cur_frame = full_f
+
+        return found, last_cur_frame
+
+    def _wait_until_text_gone_fast(
+        self,
+        query: str,
+        active_win: dict[str, Any] | None,
+        *,
+        area: tuple[int, int, int, int] | None = None,
+        timeout_ms: int = 4000,
+        allow_ocr: bool = True,
+    ) -> dict[str, Any]:
+        """Bbox-locked pixel-diff waiter for wait(gone=...) (~0.25 ms/poll, ~4.5 ms tiny-crop verify)."""
+        t_start = time.monotonic()
+        deadline = t_start + timeout_ms / 1000.0
+
+        # Native AX fast path: if AX currently sees it, wait until AX no longer sees it
+        if self._find_text_point(query, active_win, area=area, allow_ocr=False) is not None:
+            while time.monotonic() < deadline:
+                if self._find_text_point(query, active_win, area=area, allow_ocr=False) is None:
+                    self._pre_step_frame = None
+                    return {"gone": True, "text": query, "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1)}
+                time.sleep(0.025)
+            return {"gone": False, "text": query}
+
+        if not (allow_ocr and self.ocr.available and self.capture.backend != "unavailable"):
+            self._pre_step_frame = None
+            return {"gone": True, "text": query, "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1)}
+
+        # Locate query ONCE in area or active_win (never fall back to full screen behind active_win!)
+        scan_frame = self._capture_wait_frame(active_win, area=area, pre_frame=None)
+        hit = self.ocr.find_text(scan_frame, query)
+        if hit is None:
+            self._pre_step_frame = None
+            return {"gone": True, "text": query, "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1)}
+
+        # Lock onto the text's tight padded bounding box (~220x60 px -> 0.2 ms capture + 4.5 ms OCR!)
+        # Crop base_crop directly from scan_frame (t=0) so if the dialog already closed during the
+        # initial OCR scan, the very first diff detects the closure immediately instead of missing it!
+        bx, by, bw, bh = hit["bbox"]
+        base_crop = self._crop_frame_logical(scan_frame, (bx, by, bw, bh), pad=24)
+        watch_area = (base_crop.origin_x, base_crop.origin_y, base_crop.logical_width, base_crop.logical_height)
+        is_mock = (scan_frame.backend == "mock")
+        first_poll = True
+
+        while time.monotonic() < deadline:
+            if not first_poll:
+                time.sleep(0.018)
+            first_poll = False
+            cur_crop = self.capture.capture(scope="area", area=watch_area, include_cursor=False)
+            if not is_mock and cur_crop.width == base_crop.width and cur_crop.height == base_crop.height:
+                d = self.capture.diff_frames(base_crop, cur_crop, ignore_rects=self._overlay_ignore_rects())
+                if d["changed_pct"] < 0.8:
+                    continue
+            still = self.ocr.find_text(cur_crop, query)
+            if still is None:
+                self._pre_step_frame = None
+                return {"gone": True, "text": query, "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1)}
+            base_crop = cur_crop
+
+        return {"gone": False, "text": query}
+
     def tool_act(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         t0 = time.perf_counter()
         raw_steps = args.get("steps")
@@ -1102,6 +1331,7 @@ class DesktopEngine:
         aborted_takeover = False
         had_mutation = False
         self._pre_step_frame = None
+        self._last_wait_frame = None
         self._prev_click = None
         last_ok_op = ""
         last_ok_submitted = False
@@ -1126,28 +1356,18 @@ class DesktopEngine:
             op = (raw_step.get("op") or raw_step.get("action") or "").lower()
             if op not in ("wait", "screenshot"):
                 had_mutation = True
-            # If next step is wait_and_click / wait(text=...), snapshot baseline before this click/key (~3 ms)
-            # so wait_and_click can diff & OCR ONLY the newly opened modal/menu (~22 ms instead of full window!)
+            # If next step is wait_and_click / wait(text=...), snapshot baseline before this click/key (~2 ms)
+            # so follow-up waits diff-crop ONLY the newly opened popup/pane (~15-45 ms) and never match stale text!
             if (
                 not bg
                 and op in ("click", "key", "hotkey", "press", "type", "click_and_type", "ax_action")
-                and idx + 1 < len(raw_steps)
-                and isinstance(raw_steps[idx + 1], dict)
-                and self.capture.backend != "unavailable"
             ):
-                nxt_op = str(raw_steps[idx + 1].get("op") or raw_steps[idx + 1].get("action") or "").lower()
-                if nxt_op == "wait_and_click" or (nxt_op == "wait" and raw_steps[idx + 1].get("text")):
-                    try:
-                        if active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
-                            self._pre_step_frame = self.capture.capture(
-                                scope="area",
-                                area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
-                                include_cursor=False,
-                            )
-                        else:
-                            self._pre_step_frame = self.capture.capture(scope="screen", include_cursor=False)
-                    except Exception:
-                        self._pre_step_frame = None
+                if idx + 1 < len(raw_steps) and isinstance(raw_steps[idx + 1], dict):
+                    nxt_op = str(raw_steps[idx + 1].get("op") or raw_steps[idx + 1].get("action") or "").lower()
+                    if nxt_op == "wait_and_click" or (nxt_op == "wait" and raw_steps[idx + 1].get("text")):
+                        self._snapshot_pre_step(active_win)
+                elif idx == len(raw_steps) - 1 and raw_step.get("submit") and observe_opt != "none":
+                    self._snapshot_pre_step(active_win)
             try:
                 if bg:
                     res, imgs = self._exec_bg_step(op, raw_step)
@@ -1194,9 +1414,13 @@ class DesktopEngine:
                     except Exception:
                         after_frame = None
                 elif settle_opt == "fast_flip" and had_mutation and self.capture.backend != "unavailable":
-                    # After wait_and_click or submit=True at end of batch, briefly wait (<=280 ms) for dialog/view swap
-                    # so post-action OCR sees the NEW screen instead of the closing modal!
-                    if (last_ok_op == "wait_and_click" or last_ok_submitted) and self._pre_step_frame is not None:
+                    if last_ok_op == "wait":
+                        # Batch ended with an explicit wait(text/gone/change); transition is already complete
+                        if self._last_wait_frame is not None:
+                            after_frame = self._last_wait_frame
+                    elif (last_ok_op == "wait_and_click" or last_ok_submitted) and self._pre_step_frame is not None:
+                        # After wait_and_click or submit=True at end of batch, briefly wait (<=280 ms) for dialog/view swap
+                        # so post-action OCR sees the NEW screen instead of the closing modal!
                         base_f = self._pre_step_frame
                         t_end = time.monotonic() + 0.28
                         while time.monotonic() < t_end:
@@ -1290,8 +1514,10 @@ class DesktopEngine:
 
         obs_frame: Frame | None = after_frame
         if want_inline_ocr and self.capture.backend != "unavailable":
+            aw_valid = bool(active_after and int(active_after.get("w", 0)) >= 120 and int(active_after.get("h", 0)) >= 100)
             if obs_frame is None:
-                if active_after and int(active_after.get("w", 0)) >= 120 and int(active_after.get("h", 0)) >= 100:
+                if aw_valid:
+                    assert active_after is not None
                     aw_r = (
                         int(active_after["x"]), int(active_after["y"]),
                         int(active_after["w"]), int(active_after["h"]),
@@ -1299,6 +1525,15 @@ class DesktopEngine:
                     obs_frame = self.capture.capture(scope="area", area=aw_r, include_cursor=False)
                 else:
                     obs_frame = self.capture.capture(scope="screen", include_cursor=False)
+            elif aw_valid and obs_frame.backend != "mock":
+                assert active_after is not None
+                aw_w, aw_h = int(active_after["w"]), int(active_after["h"])
+                if obs_frame.logical_width > aw_w + 40 or obs_frame.logical_height > aw_h + 40:
+                    obs_frame = self._crop_frame_logical(
+                        obs_frame,
+                        (int(active_after["x"]), int(active_after["y"]), aw_w, aw_h),
+                        pad=0,
+                    )
             t_ocr = time.perf_counter()
             words = self.ocr.scan_frame(obs_frame)
             ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
@@ -1531,103 +1766,30 @@ class DesktopEngine:
             if not q:
                 raise ValueError("wait_and_click requires 'text'")
             timeout_ms = max(50, min(15000, int(step.get("timeout_ms", 2500))))
-            poll_s = max(0.018, min(0.5, float(step.get("poll_ms", 25)) / 1000.0))
+            poll_s = max(0.018, min(0.5, float(step.get("poll_ms", 20)) / 1000.0))
             raw_area = step.get("area")
             area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
             allow_ocr = bool(step.get("ocr", True))
             ox = int(step.get("offset_x", 0))
             oy = int(step.get("offset_y", 0))
             t_start = time.monotonic()
-            deadline = t_start + timeout_ms / 1000.0
-            found: tuple[int, int, str] | None = None
-            pre_frame = self._pre_step_frame
-            last_cur_frame: Frame | None = None
-            retried_prev = False
-            retry_prev_ok = bool(step.get("retry_prev", True))
-
-            while True:
-                # Fast path 1: AX cache/tree (instant on native apps)
-                found = self._find_text_point(q, active_win, area=area, allow_ocr=False)
-                if found is not None:
-                    break
-                # Fast path 2: diff against pre-click frame -> OCR ONLY the newly opened popup/modal (~22 ms!)
-                if allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
-                    if area is not None:
-                        cur_frame = self.capture.capture(scope="area", area=area, include_cursor=False)
-                    elif pre_frame is not None:
-                        cur_frame = self.capture.capture(
-                            scope="area",
-                            area=(pre_frame.origin_x, pre_frame.origin_y, pre_frame.logical_width, pre_frame.logical_height),
-                            include_cursor=False,
-                        )
-                    elif active_win and int(active_win.get("w", 0)) >= 120 and int(active_win.get("h", 0)) >= 100:
-                        cur_frame = self.capture.capture(
-                            scope="area",
-                            area=(int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"])),
-                            include_cursor=False,
-                        )
-                    else:
-                        cur_frame = self.capture.capture(scope="screen", include_cursor=False)
-                    last_cur_frame = cur_frame
-
-                    used_crop = False
-                    waiting_for_paint = False
-                    if (
-                        pre_frame is not None
-                        and area is None
-                        and cur_frame.width == pre_frame.width
-                        and cur_frame.height == pre_frame.height
-                    ):
-                        d = self.capture.diff_frames(pre_frame, cur_frame, ignore_rects=self._overlay_ignore_rects())
-                        bbox = d.get("changed_bbox")
-                        if d["changed_pct"] >= 0.18 and bbox:
-                            bw, bh = bbox[2], bbox[3]
-                            if (bw * bh) < (cur_frame.logical_width * cur_frame.logical_height * 0.72):
-                                crop = self._crop_frame_logical(cur_frame, bbox, pad=36)
-                                hit = self.ocr.find_text(crop, q)
-                                used_crop = True
-                                if hit is not None:
-                                    found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-popup({hit['match_type']})")
-                                    break
-                        elif (time.monotonic() - t_start) < 0.14:
-                            # Screen hasn't painted the post-click transition yet; skip full-window OCR for 20 ms
-                            waiting_for_paint = True
-                        elif (
-                            retry_prev_ok
-                            and not retried_prev
-                            and self._prev_click is not None
-                            and (time.monotonic() - t_start) >= 0.42
-                        ):
-                            # Preceding click was likely swallowed by a closing modal animation; retry it ONCE!
-                            rx, ry, rbtn = self._prev_click
-                            retried_prev = True
-                            self._exec_step(
-                                "click", {"op": "click", "x": rx, "y": ry, "button": rbtn}, active_win,
-                                smooth=False, independent_cursor=independent_cursor, _depth=_depth + 1,
-                            )
-                            waiting_for_paint = True
-                    # Full active-window fallback if popup didn't match or text was already visible
-                    if not waiting_for_paint and (not used_crop or (time.monotonic() - t_start) > 0.14):
-                        hit = self.ocr.find_text(cur_frame, q)
-                        if hit is not None:
-                            found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})")
-                            break
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(poll_s)
-
-            if found is None:
-                # Final full-screen fallback in case a dialog opened outside active_win bounds
-                if allow_ocr and self.ocr.available and self.capture.backend != "unavailable":
-                    full_f = self.capture.capture(scope="screen", include_cursor=False)
-                    hit = self.ocr.find_text(full_f, q)
-                    if hit is not None:
-                        found = (int(hit["center"][0]), int(hit["center"][1]), f"ocr-screen({hit['match_type']})")
+            found, last_cur_frame = self._wait_for_text_fast(
+                q,
+                active_win,
+                area=area,
+                timeout_ms=timeout_ms,
+                poll_s=poll_s,
+                allow_ocr=allow_ocr,
+                retry_prev_ok=bool(step.get("retry_prev", True)),
+                independent_cursor=independent_cursor,
+                _depth=_depth,
+            )
             if found is None:
                 raise TimeoutError(f"wait_and_click timed out after {timeout_ms}ms waiting for {q!r}")
 
-            # Store frame right before clicking so the NEXT chained wait_and_click diffs against this modal!
+            # Store frame right before clicking so the NEXT chained wait_and_click / wait(text=...) diffs against this state!
             self._pre_step_frame = last_cur_frame
+            self._last_wait_frame = None
             px, py = self._clamp_screen(found[0] + ox, found[1] + oy)
             src = found[2]
             click_step = {
@@ -1722,14 +1884,26 @@ class DesktopEngine:
             count = max(1, min(200, int(step.get("count", 1))))
             delay_s = max(0.0, min(1.0, float(step.get("delay_ms", 8)) / 1000.0))
             for r_i in range(count):
-                for sub in inner:
+                for s_idx, sub in enumerate(inner):
                     sub_op = str(sub.get("op") or sub.get("action") or "").lower()
-                    _, sub_imgs, active_win = self._exec_step(
+                    if (
+                        sub_op in ("click", "key", "hotkey", "press", "type", "click_and_type", "ax_action")
+                        and s_idx + 1 < len(inner)
+                        and isinstance(inner[s_idx + 1], dict)
+                    ):
+                        nxt_op = str(inner[s_idx + 1].get("op") or inner[s_idx + 1].get("action") or "").lower()
+                        if nxt_op == "wait_and_click" or (nxt_op == "wait" and inner[s_idx + 1].get("text")):
+                            self._snapshot_pre_step(active_win)
+                    sub_res, sub_imgs, active_win = self._exec_step(
                         sub_op, sub, active_win,
                         smooth=bool(sub.get("smooth", smooth)),
                         independent_cursor=bool(sub.get("independent_cursor", independent_cursor)),
                         _depth=_depth + 1,
                     )
+                    if sub_op == "click" and isinstance(sub_res.get("pos"), list) and len(sub_res["pos"]) == 2:
+                        self._prev_click = (int(sub_res["pos"][0]), int(sub_res["pos"][1]), str(sub_res.get("button", "left")))
+                    elif sub_op != "wait_and_click":
+                        self._prev_click = None
                     extra_images.extend(sub_imgs)
                 if delay_s > 0 and r_i < count - 1:
                     time.sleep(delay_s)
@@ -1934,35 +2108,42 @@ class DesktopEngine:
                 q = str(step["gone"])
                 raw_area = step.get("area")
                 area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
-                t_start = time.monotonic()
-                deadline = t_start + timeout_ms / 1000.0
-                while time.monotonic() < deadline:
-                    hit = self._find_text_point(q, active_win, area=area, allow_ocr=bool(step.get("ocr", True)))
-                    if hit is None:
-                        return {
-                            "gone": True,
-                            "text": q,
-                            "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
-                        }, extra_images, active_win
-                    time.sleep(0.03)
-                return {"gone": False, "text": q}, extra_images, active_win
+                self._last_wait_frame = None
+                res_gone = self._wait_until_text_gone_fast(
+                    q,
+                    active_win,
+                    area=area,
+                    timeout_ms=timeout_ms,
+                    allow_ocr=bool(step.get("ocr", True)),
+                )
+                return res_gone, extra_images, active_win
             if step.get("text"):
                 q = str(step["text"])
                 raw_area = step.get("area")
                 area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
                 t_start = time.monotonic()
-                deadline = t_start + timeout_ms / 1000.0
-                while time.monotonic() < deadline:
-                    aw = self.windows.state().get("active")
-                    hit = self._find_text_point(q, aw, area=area, allow_ocr=bool(step.get("ocr", True)))
-                    if hit is not None:
-                        return {
-                            "found": True,
-                            "pos": [hit[0], hit[1]],
-                            "source": hit[2],
-                            "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
-                        }, extra_images, aw
-                    time.sleep(0.05)
+                poll_s = max(0.018, min(0.5, float(step.get("poll_ms", 20)) / 1000.0))
+                found, last_cur_frame = self._wait_for_text_fast(
+                    q,
+                    active_win,
+                    area=area,
+                    timeout_ms=timeout_ms,
+                    poll_s=poll_s,
+                    allow_ocr=bool(step.get("ocr", True)),
+                    retry_prev_ok=bool(step.get("retry_prev", False)),
+                    independent_cursor=independent_cursor,
+                    _depth=_depth,
+                )
+                if found is not None:
+                    self._pre_step_frame = last_cur_frame
+                    self._last_wait_frame = last_cur_frame if area is None else None
+                    return {
+                        "found": True,
+                        "pos": [found[0], found[1]],
+                        "source": found[2],
+                        "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
+                    }, extra_images, active_win
+                self._last_wait_frame = None
                 return {"found": False, "text": q}, extra_images, active_win
             ms = max(0, min(10000, int(step.get("ms", 150))))
             time.sleep(ms / 1000.0)

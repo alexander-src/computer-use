@@ -14,11 +14,11 @@ Control Linux, Windows, and macOS desktops with minimal LLM round-trips via MCP 
    - Use compound ops so polling, typing, and clicking execute locally instead of waiting for cloud LLM turns:
      - `launch`: `{op: "launch", command: "discord"}` (focuses an existing matching window in ~1.5 ms, or launches and waits for the matching window)
      - `open_url`: `{op: "open_url", app: "brave", url: "https://...", new_tab: true}`
-     - `wait_and_click`: `{op: "wait_and_click", text: "Create My Own", timeout_ms: 2500, offset_x?: 0, offset_y?: 0, type_text?: "...", submit?: true}` (diffs against the pre-click frame and OCRs only the newly opened modal in ~22 ms, handling both dark apps and white dialogs cleanly)
+     - `wait_and_click`: `{op: "wait_and_click", text: "Create My Own", timeout_ms: 2500, offset_x?: 0, offset_y?: 0, type_text?: "...", submit?: true}` (diffs against the pre-click frame so it never matches stale text, OCRs only the newly opened modal in ~15 to 35 ms, and handles dark apps, white dialogs, and colored buttons cleanly)
      - `click_and_type`: `{op: "click_and_type", target: "SERVER NAME", offset_y: 28, text: "My Server", clear: true, submit: true}`
      - `keys`: `{op: "keys", sequence: ["ctrl+a", "ctrl+c", "alt+tab", "ctrl+v"], delay_ms: 10}`
      - `repeat`: `{op: "repeat", count: 5, steps: [{op: "key", keys: "down"}]}`
-   - Never insert blind 400 to 1000 ms sleeps between steps. Use `wait_and_click(text=...)` for opening modals (auto-retries a swallowed preceding click once), `wait(gone="Create Channel", timeout_ms=2000)` to resume the millisecond a submitted dialog closes, or `wait(change=true, timeout_ms=800)` for visual transitions.
+   - Never insert blind 400 to 1000 ms sleeps between steps. Use `wait_and_click(text=...)` or `wait(text=...)` for opening dialogs (both share pre-click diff-cropping so they skip stale pre-click matches and unchanged frames), `wait(gone="Create Channel", timeout_ms=2000)` to lock onto the target bounding box and resume the millisecond a submitted dialog closes (`0.25 ms` pixel diff + `4.5 ms` tiny-crop verify), or `wait(change=true, timeout_ms=800)` for visual transitions.
 
 2. Avoid wasted double-turn screenshot reads (`desktop_observe` and `observe: "auto"`):
    - On sparse-AX apps (Discord, Brave, Chrome, Electron, VS Code, Spotify, Telegram), `desktop_observe()` and `desktop_act(observe="auto")` run pre-warmed 8-thread `tessdata_fast` local OCR and return inline `[x,y] "Label"` coordinates plus a ready `SCREENSHOT_PATH` grid JPEG (1 ms save, zero image offload).
