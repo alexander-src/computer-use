@@ -461,7 +461,9 @@ class TestEngineAndProtocol(unittest.TestCase):
         self.assertIn(("type_text", "hello bg"), bg.events)
 
     def test_type_modes_and_terminal_paste(self):
+        # Linux auto mode: >24 chars in terminal uses atomic ctrl+shift+v paste and restores clipboard
         eng, wm, clip, inp, ax, ov, bg = self._make_engine(active_app="konsole")
+        eng._is_windows = False
         eng.tool_act({
             "steps": [{"op": "type", "text": "echo 'hello world from terminal paste test'"}],
             "settle": "none",
@@ -470,6 +472,39 @@ class TestEngineAndProtocol(unittest.TestCase):
         })
         self.assertIn(("hotkey", ("ctrl+shift+v", 1)), inp.events)
         self.assertEqual(clip.value, "saved-user-clip")
+
+        # Windows auto mode: <=500 chars uses KEYEVENTF_UNICODE directly without touching clipboard
+        eng_w, _, clip_w, inp_w, _, _, _ = self._make_engine(active_app="powershell")
+        eng_w._is_windows = True
+        eng_w.tool_act({
+            "steps": [{"op": "type", "text": "echo 'hello world from windows unicode typing'"}],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn(("type_keys", "echo 'hello world from windows unicode typing'"), inp_w.events)
+        self.assertEqual(clip_w.value, "saved-user-clip")
+
+        # Windows explicit paste mode: classic PowerShell/cmd uses ctrl+v, Windows Terminal uses ctrl+shift+v
+        eng_w.tool_act({
+            "steps": [{"op": "type", "text": "pasted-ps", "mode": "paste"}],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn(("hotkey", ("ctrl+v", 1)), inp_w.events)
+        self.assertEqual(clip_w.value, "saved-user-clip")
+
+        eng_wt, _, clip_wt, inp_wt, _, _, _ = self._make_engine(active_app="windowsterminal")
+        eng_wt._is_windows = True
+        eng_wt.tool_act({
+            "steps": [{"op": "type", "text": "pasted-wt", "mode": "paste"}],
+            "settle": "none",
+            "verify_change": False,
+            "observe": "none",
+        })
+        self.assertIn(("hotkey", ("ctrl+shift+v", 1)), inp_wt.events)
+        self.assertEqual(clip_wt.value, "saved-user-clip")
 
     def test_mcp_protocol_7_tools_and_audit_log(self):
         with tempfile.TemporaryDirectory() as td:
