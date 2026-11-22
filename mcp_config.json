@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "computer-use": {
+      "command": "/usr/bin/python3",
+      "args": [
+        "scripts/computer_use_mcp.py"
+      ]
+    }
+  }
+}

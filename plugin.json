@@ -1,0 +1,18 @@
+{
+  "name": "computer-use",
+  "displayName": "Computer Use",
+  "version": "1.0.0",
+  "description": "Fast native Linux desktop automation for Antigravity over MCP: direct KWin ScreenShot2 capture, kernel /dev/uinput absolute pointer and keyboard, AT-SPI2 semantic [ref] diffs, Set-of-Marks and 0..1000 coordinate grid, window management, and atomic clipboard paste.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Observe my current desktop windows and active app elements",
+    "Take a coordinate-grid screenshot of my active window",
+    "Check my computer-use backend status and capture latency"
+  ],
+  "author": {
+    "name": "alexander-src",
+    "url": "https://github.com/alexander-src"
+  },
+  "homepage": "https://github.com/alexander-src/computer-use",
+  "repository": "https://github.com/alexander-src/computer-use"
+}

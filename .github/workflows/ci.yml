@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python native bindings (numpy, GdkPixbuf, Cairo, AT-SPI2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-numpy python3-gi python3-cairo gir1.2-gdkpixbuf-2.0 gir1.2-atspi-2.0
+      - name: Run unit and protocol tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Validate plugin.json and mcp_config.json
+        run: |
+          /usr/bin/python3 -c '
+          import json
+          p = json.load(open("plugin.json"))
+          assert p["name"] == "computer-use"
+          assert len(p["suggestedPrompts"]) == 3
+          m = json.load(open("mcp_config.json"))
+          assert "computer-use" in m["mcpServers"]
+          print("Manifest validation passed")
+          '
