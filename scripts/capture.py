@@ -338,9 +338,10 @@ class ScreenCapture:
         scale_x = out_w / max(1, src_w)
         scale_y = out_h / max(1, src_h)
 
-        raw_bytes = frame.rgba.tobytes()
+        # Strip unused alpha channel up front: 25% less memory for scaling and required by glycin's JPEG encoder (Rgb8)
+        rgb = np.ascontiguousarray(frame.rgba[:, :, :3])
         pb = GdkPixbuf.Pixbuf.new_from_bytes(
-            GLib.Bytes.new(raw_bytes), GdkPixbuf.Colorspace.RGB, True, 8, src_w, src_h, src_w * 4
+            GLib.Bytes.new(rgb.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, src_w, src_h, src_w * 3
         )
         if out_w != src_w or out_h != src_h:
             pb = pb.scale_simple(out_w, out_h, GdkPixbuf.InterpType.BILINEAR)
@@ -400,9 +401,13 @@ class ScreenCapture:
         from gi.repository import GdkPixbuf, GLib
 
         w, h, rs = pb.get_width(), pb.get_height(), pb.get_rowstride()
-        # GdkPixbuf is RGBA; Cairo ARGB32 on little-endian is BGRA
-        arr = np.frombuffer(pb.get_pixels(), dtype=np.uint8).reshape((h, rs // 4, 4))[:, :w, :]
-        bgra = np.ascontiguousarray(arr[:, :, [2, 1, 0, 3]])
+        nch = pb.get_n_channels()
+        # GdkPixbuf is RGB or RGBA; Cairo ARGB32 on little-endian is BGRA
+        raw = np.frombuffer(pb.get_pixels(), dtype=np.uint8).reshape((h, rs))[:, : w * nch].reshape((h, w, nch))
+        bgra = np.empty((h, w, 4), dtype=np.uint8)
+        bgra[:, :, 0] = raw[:, :, 2]
+        bgra[:, :, 1] = raw[:, :, 1]
+        bgra[:, :, 2] = raw[:, :, 0]
         bgra[:, :, 3] = 255
         surf = cairo.ImageSurface.create_for_data(bgra, cairo.FORMAT_ARGB32, w, h, w * 4)
         ctx = cairo.Context(surf)
@@ -479,7 +484,7 @@ class ScreenCapture:
                 ctx.stroke()
 
         surf.flush()
-        rgba_out = np.ascontiguousarray(bgra[:, :, [2, 1, 0, 3]])
+        rgb_out = np.ascontiguousarray(bgra[:, :, [2, 1, 0]])
         return GdkPixbuf.Pixbuf.new_from_bytes(
-            GLib.Bytes.new(rgba_out.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4
+            GLib.Bytes.new(rgb_out.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3
         )
