@@ -249,13 +249,12 @@ class FastOCR:
         with self._lock:
             if self._init_done:
                 return self._available
-            self._init_done = True
             # Prevent internal OpenMP oversubscription when running N strip workers in parallel
             os.environ.setdefault("OMP_THREAD_LIMIT", "1")
-            path = self._find_lib()
-            if not path:
-                return False
             try:
+                path = self._find_lib()
+                if not path:
+                    return False
                 lib = ctypes.CDLL(path)
                 lib.TessBaseAPICreate.argtypes = []
                 lib.TessBaseAPICreate.restype = ctypes.c_void_p
@@ -305,6 +304,9 @@ class FastOCR:
             except Exception:
                 self.close()
                 return False
+            finally:
+                # Set _init_done AFTER _available is finalized so concurrent prewarm() never exposes available=False!
+                self._init_done = True
 
     @property
     def available(self) -> bool:
