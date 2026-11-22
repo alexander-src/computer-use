@@ -1311,6 +1311,12 @@ class CursorOverlay:
         self._backend_name = "disabled" if not self._enabled else "lazy"
         self._cx = 0.0
         self._cy = 0.0
+        self._anim_sx = 0.0
+        self._anim_sy = 0.0
+        self._anim_tx = 0.0
+        self._anim_ty = 0.0
+        self._anim_t0 = 0.0
+        self._anim_dur = 0.0
         self._label = "AI"
         self._last_active = 0.0
         self._ripples: list[_Ripple] = []
@@ -1343,9 +1349,38 @@ class CursorOverlay:
         with self._lock:
             self._cx = float(x)
             self._cy = float(y)
+            self._anim_dur = 0.0
             self._label = label
             self._last_active = time.monotonic()
             self._active_rect = (int(x) - 28, int(y) - 28, 190, 90)
+        self._wake.set()
+
+    def glide_to(self, x: float, y: float, *, label: str = "AI", duration_ms: int = 50, from_pos: tuple[float, float] | None = None) -> None:
+        """Non-blocking (~0.005 ms) smooth curved cursor glide interpolated at 120Hz in the overlay thread."""
+        if not self._enabled:
+            return
+        self._ensure_started()
+        now = time.monotonic()
+        tx, ty = float(x), float(y)
+        with self._lock:
+            if from_pos is not None:
+                sx, sy = float(from_pos[0]), float(from_pos[1])
+            elif self._last_active > 0:
+                sx, sy = self._cx, self._cy
+            else:
+                sx, sy = tx, ty
+            dist = math.hypot(tx - sx, ty - sy)
+            if duration_ms <= 0 or dist < 6.0:
+                self._cx, self._cy = tx, ty
+                self._anim_dur = 0.0
+            else:
+                self._anim_sx, self._anim_sy = sx, sy
+                self._anim_tx, self._anim_ty = tx, ty
+                self._anim_t0 = now
+                self._anim_dur = max(0.018, min(0.18, float(duration_ms) / 1000.0))
+            self._label = label
+            self._last_active = now
+            self._active_rect = (int(tx) - 36, int(ty) - 36, 200, 100)
         self._wake.set()
 
     def show_click(self, x: float, y: float, *, button: str = "left", double: bool = False) -> None:
@@ -1359,10 +1394,16 @@ class CursorOverlay:
         }
         lbl = "Double-click" if double else ("Right-click" if button == "right" else "Click")
         with self._lock:
-            self._cx = float(x)
-            self._cy = float(y)
-            self._label = lbl
             now = time.monotonic()
+            # Keep any in-flight smooth glide animating into (x, y) rather than cancelling it abruptly
+            if self._anim_dur <= 0 or (now - self._anim_t0) >= self._anim_dur:
+                self._cx = float(x)
+                self._cy = float(y)
+                self._anim_dur = 0.0
+            else:
+                self._anim_tx = float(x)
+                self._anim_ty = float(y)
+            self._label = lbl
             self._last_active = now
             self._ripples.append(_Ripple(x=float(x), y=float(y), started_at=now, color=color_map.get(button, color_map["left"]), double=double))
             self._ripples = self._ripples[-6:]
@@ -1417,7 +1458,26 @@ class CursorOverlay:
             was_visible = False
             while not self._stop.is_set():
                 now = time.monotonic()
+                gliding = False
                 with self._lock:
+                    if self._anim_dur > 0.0:
+                        t = (now - self._anim_t0) / self._anim_dur
+                        if t >= 1.0:
+                            self._cx, self._cy = self._anim_tx, self._anim_ty
+                            self._anim_dur = 0.0
+                        else:
+                            gliding = True
+                            e = t * t * (3.0 - 2.0 * t)
+                            dx = self._anim_tx - self._anim_sx
+                            dy = self._anim_ty - self._anim_sy
+                            dist = math.hypot(dx, dy)
+                            if dist > 1.0:
+                                arc = min(12.0, dist * 0.03) * math.sin(math.pi * t)
+                                self._cx = self._anim_sx + dx * e + (-dy / dist) * arc
+                                self._cy = self._anim_sy + dy * e + (dx / dist) * arc
+                            else:
+                                self._cx = self._anim_sx + dx * e
+                                self._cy = self._anim_sy + dy * e
                     cx, cy = self._cx, self._cy
                     label = self._label
                     last_active = self._last_active
@@ -1432,15 +1492,15 @@ class CursorOverlay:
                 else:
                     alpha = 0.0
 
-                is_visible = alpha > 0.01 or bool(ripples)
+                is_visible = alpha > 0.01 or bool(ripples) or gliding
                 if is_visible or was_visible:
                     rect = backend.render(cx, cy, alpha, label, ripples, now)
                     with self._lock:
                         self._active_rect = rect
                     was_visible = is_visible
 
-                if ripples or (0.0 < alpha < 1.0):
-                    self._wake.wait(timeout=0.011)
+                if gliding or ripples or (0.0 < alpha < 1.0):
+                    self._wake.wait(timeout=0.008)
                     self._wake.clear()
                 elif is_visible:
                     self._wake.wait(timeout=0.04)

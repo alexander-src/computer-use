@@ -195,7 +195,7 @@ def _draw_cairo_overlays(
         for n in range(100, 1000, 100):
             gx = round(w * n / 1000.0) + 0.5
             gy = round(h * n / 1000.0) + 0.5
-            set_rgba(0.0, 0.85, 1.0, 0.28)
+            set_rgba(0.0, 0.85, 1.0, 0.16)
             ctx.move_to(gx, 0)
             ctx.line_to(gx, h)
             ctx.move_to(0, gy)
@@ -206,7 +206,7 @@ def _draw_cairo_overlays(
             ctx.rectangle(gx - 12, 2, 26, 13)
             ctx.rectangle(2, gy - 7, 26, 13)
             ctx.fill()
-            set_rgba(0.4, 0.95, 1.0, 0.95)
+            set_rgba(0.4, 0.95, 1.0, 0.92)
             ctx.move_to(gx - 10, 12)
             ctx.show_text(lbl)
             ctx.move_to(4, gy + 3)

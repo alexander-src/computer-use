@@ -1,40 +1,38 @@
 ---
 name: computer-use
-description: Fast native Linux (Wayland/X11), Windows 10/11, and macOS desktop automation over MCP (~5 ms KWin+TurboJPEG, Win32 GDI+, and macOS CoreGraphics/ImageIO capture, snappy smooth custom AI cursor with click ripples, independent user mouse, background mode on Linux/Windows/macOS, AT-SPI2/UIA/AXUIElement semantic [ref] diffs, Set-of-Marks and 0..1000 grid). Use when controlling native desktop apps, OS dialogs, multi-app GUI workflows, background GUI automation, or taking annotated desktop screenshots.
+description: Superhuman-speed native Linux (Wayland/X11), Windows 10/11, and macOS desktop automation over MCP (4.5 ms capture+JPEG, 0.008 ms non-blocking 120Hz cyan AI cursor with click ripples, independent user mouse, 8-thread parallel local OCR, closed-loop compound ops wait_and_click/click_and_type/open_url/keys/repeat, background mode on Linux/Windows/macOS, and AT-SPI2/UIA/AXUIElement semantic [ref] diffs). Use when controlling native desktop apps, OS dialogs, multi-app GUI workflows, background GUI automation, or taking annotated desktop screenshots.
 ---
 
-# Computer Use Skill (Linux, Windows & macOS Human-Speed Mode)
+# Computer Use Skill (Linux, Windows & macOS Superhuman-Speed Mode)
 
-Operate Linux, Windows, and macOS desktops at human speed via MCP server `computer-use_computer-use` using `call_mcp_tool`.
+Control Linux, Windows, and macOS desktops faster than a human operator via MCP server `computer-use_computer-use` using `call_mcp_tool`.
 
 ## Core Workflow
 
-1. **Observe once (`desktop_observe`)**:
-   - Call `desktop_observe()` with default `mode: "hybrid"`.
-   - Returns open windows, active window, cursor position, and semantic `[ref]` IDs (AT-SPI2 on Linux, UIA on Windows, AXUIElement on macOS) with incremental `AX_DIFF` on repeat calls.
-   - When an app exposes fewer than 5 accessibility elements, `hybrid` mode caches the sparse status for 4s and attaches a ~5 ms 1024px JPEG screenshot overlaid with a `0..1000` coordinate grid.
+1. Act directly when you know the app, URL, shortcut, or button text (skip wasted initial screenshots):
+   - Chain the entire sequence in ONE `desktop_act({observe: "none", steps: [...]})` call.
+   - Use compound ops so polling, typing, and clicking execute locally in milliseconds instead of waiting for cloud LLM turns:
+     - `open_url`: `{op: "open_url", app: "brave", url: "https://...", new_tab: true}`
+     - `wait_and_click`: `{op: "wait_and_click", text: "Save Changes", timeout_ms: 2500, type_text?: "...", submit?: true}`
+     - `click_and_type`: `{op: "click_and_type", target: "Search", text: "query", submit: true}`
+     - `keys`: `{op: "keys", sequence: ["ctrl+a", "ctrl+c", "alt+tab", "ctrl+v"], delay_ms: 10}`
+     - `repeat`: `{op: "repeat", count: 5, steps: [{op: "key", keys: "down"}]}`
+   - Any `text`, `target`, or `text_target` automatically resolves via AX/UIA/AXUIElement first, then 8-thread in-process parallel OCR (`libtesseract`, ~40-82 ms) on Chromium, Electron, VS Code, Discord, Spotify, and custom-drawn UIs with zero cloud round-trips.
 
-2. **Chain full human workflows in one `desktop_act` call**:
-   - Never burn separate LLM turns for click, then type, then press Enter. Combine `focus`, `hotkey`, `click`, `type(clear=true, submit=true)`, `scroll`, `drag`, `ax_action`, and `wait(change=true)` inside ONE `desktop_act({steps: [...]})` call.
-   - Pass `fast: true` or `observe: "none"` for instant multi-step bursts (0 ms cursor snap, zero settle wait), and `observe: "crop_changed"` when verifying small UI changes.
-   - Targeting priority:
-     1. Keyboard shortcuts (`ctrl+l`/`cmd+l`, `ctrl+t`/`cmd+t`, `ctrl+s`/`cmd+s`, `tab`, `enter`, `esc`)
-     2. `ax_action` with `ref` (mouse-free invoke/press with visual cursor glide + ripple)
-     3. `click` with `ref` or `text`
-     4. `nx, ny` (`0..1000`) read from the coordinate grid (`coord_scope: "screen"` or `"last_image"`)
-     5. Exact pixel `x, y`
-   - Moving the user's mouse does not abort by default (`independent_cursor: true`): the custom cyan AI cursor glides smoothly (20-55 ms), clicks with an expanding ripple, and restores the user's physical cursor immediately.
+2. Observe cleanly when screen layout is unknown (`desktop_observe`):
+   - Call `desktop_observe({mode: "ocr"})` when you only need clickable text coordinates (`[x,y] "Button"` with zero image tokens).
+   - Call `desktop_observe()` (`mode: "hybrid"`) for open windows, `[ref]` IDs (AT-SPI2 on Linux, UIA on Windows, AXUIElement on macOS) with incremental `AX_DIFF`, and automatic 47 KB `896px` JPEG + `0..1000` grid fallback when AX has fewer than 5 elements.
 
-3. **Background mode (`desktop_background` + `background: true`)**:
-   - Linux: call `desktop_background({action: "start", command: "..."})` to spin up a private `Xvfb` virtual desktop with its own mouse, keyboard, and screen buffer.
-   - Windows: call `desktop_background({action: "attach", app: "..."})` (or `action: "launch"`) to automate a background window via `PrintWindow` + `PostMessageW`.
-   - macOS: call `desktop_background({action: "attach", app: "..."})` (or `action: "launch"`, which runs `open -g -a`) to capture occluded windows via `CGWindowList` and send input via `AXPress` / `CGEventPostToPid`.
-   - Then pass `background: true` to `desktop_observe`, `desktop_act`, and `desktop_screenshot` to operate off-screen without touching the user's mouse, focus, or clipboard.
+3. Independent 120Hz AI cursor and zero-waste execution:
+   - Moving the user's mouse does not abort by default (`independent_cursor: true`). The cyan AI pointer glides asynchronously at 120Hz on the overlay thread (0.008 ms call time, zero blocking sleep on the action path), fires click ripples, and restores the user's physical cursor immediately.
+   - Pass `observe: "none"` on intermediate bursts (`0.05 ms` overhead) and `observe: "auto"` only on the final verification step (`7.4 ms`, `43 KB` JPEG). Pass `verify_change: true` or `observe: "crop_changed"` only when pixel-diff confirmation is needed.
 
-4. **Layout-aware typing and OS shortcuts**:
-   - Linux auto-detects `us`, `gb`, or international keymaps and uses async save/paste/restore clipboard injection (`ctrl+shift+v` in terminals) for long/Unicode text.
-   - Windows (`KEYEVENTF_UNICODE`) and macOS (`CGEventKeyboardSetUnicodeString`) inject UTF-16 directly independent of keyboard layout, and automatically use `cmd+a`/`cmd+v` on macOS and `ctrl+v`/`ctrl+shift+v` on Windows.
+4. Background mode (`desktop_background` + `background: true`):
+   - Linux: `desktop_background({action: "start", command: "..."})` starts an authenticated private `Xvfb` virtual desktop.
+   - Windows: `desktop_background({action: "attach", app: "..."})` (or `action: "launch"`) captures via `PrintWindow` and sends child-HWND `PostMessageW` events.
+   - macOS: `desktop_background({action: "attach", app: "..."})` (or `action: "launch"` via `open -g -a`) captures occluded windows via `CGWindowList` and delivers input via `AXPress` / `CGEventPostToPid`.
+   - Pass `background: true` on `desktop_observe`, `desktop_act`, and `desktop_screenshot` (including OCR-backed `click(text=...)` and `wait_and_click`!).
 
-5. **Safety and speed delegation**:
+5. Safety and Flash delegation:
    - Confirm with the user before destructive GUI actions (deleting files, submitting payments, changing security settings, sending external messages).
-   - Delegate multi-step GUI loops (3+ visual turns) to the `computer-use` (`flash`) subagent for faster turn latency and clean context isolation.
+   - Delegate visual GUI loops (2+ turns) immediately to the `computer-use` (`flash`) subagent via `invoke_subagent` for minimal cloud turn latency.

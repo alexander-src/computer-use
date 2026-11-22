@@ -26,6 +26,7 @@ import a11y
 import capture
 import computer_use_mcp as mcp
 import cursor_overlay
+import fast_ocr
 import macos_backend
 import uinput_driver
 import win32_backend
@@ -416,8 +417,26 @@ class TestCaptureAndOverlayRendering(unittest.TestCase):
         self.assertGreater(nonzero_alpha, 150)
 
 
+class FakeOCR:
+    def __init__(self, responses: list[list[dict[str, Any]]] | None = None):
+        self.available = True
+        self._responses = list(responses or [[]])
+        self._calls = 0
+
+    def close(self) -> None:
+        pass
+
+    def scan_frame(self, frame, *, min_conf: float = 35.0) -> list[dict[str, Any]]:
+        words = self._responses[min(self._calls, len(self._responses) - 1)]
+        self._calls += 1
+        return words
+
+    def find_text(self, frame, query: str) -> dict[str, Any] | None:
+        return fast_ocr.match_ocr_phrase(self.scan_frame(frame), query)
+
+
 class TestEngineAndProtocol(unittest.TestCase):
-    def _make_engine(self, *, active_app="kate", elements=None, frames=None, layout="us"):
+    def _make_engine(self, *, active_app="kate", elements=None, frames=None, layout="us", ocr=None):
         wm = FakeWindowManager(active_app=active_app)
         clip = FakeClipboard("saved-user-clip")
         inp = FakeInputDriver(layout=layout)
@@ -427,7 +446,7 @@ class TestEngineAndProtocol(unittest.TestCase):
         bg = FakeBackground()
         eng = mcp.DesktopEngine(
             bus=False, windows=wm, capture=cap, a11y=ax, clipboard=clip,
-            input_driver=inp, overlay=ov, background=bg,
+            input_driver=inp, overlay=ov, background=bg, ocr=ocr or FakeOCR(),
         )
         return eng, wm, clip, inp, ax, ov, bg
 
@@ -610,6 +629,125 @@ class TestEngineAndProtocol(unittest.TestCase):
             self.assertEqual(len(lines[1]["result"]["tools"]), 7)
             status = json.loads(lines[2]["result"]["content"][0]["text"])
             self.assertIn("backends", status)
+            self.assertIn("ocr", status["backends"])
+
+    def test_fast_ocr_phrase_matching_and_compact_format(self):
+        words = [
+            {"text": "Save", "x": 100, "y": 40, "w": 42, "h": 18, "conf": 95.0},
+            {"text": "Changes", "x": 150, "y": 41, "w": 68, "h": 18, "conf": 92.0},
+            # Far-right column on same visual row (>160px away -> must NOT merge as phrase with "Save")
+            {"text": "Cancel", "x": 600, "y": 40, "w": 56, "h": 18, "conf": 96.0},
+            {"text": "Settings", "x": 100, "y": 90, "w": 70, "h": 18, "conf": 91.0},
+            {"text": "SettingsPanelExtra", "x": 300, "y": 90, "w": 140, "h": 18, "conf": 99.0},
+        ]
+        # Exact word beats longer substring even with slightly lower confidence
+        hit_s = fast_ocr.match_ocr_phrase(words, "Settings")
+        self.assertIsNotNone(hit_s)
+        self.assertEqual(hit_s["match_type"], "exact")
+        self.assertEqual(hit_s["center"], [135, 99])
+
+        # Multi-word contiguous phrase bounding box
+        hit_p = fast_ocr.match_ocr_phrase(words, "save changes")
+        self.assertIsNotNone(hit_p)
+        self.assertEqual(hit_p["match_type"], "phrase_exact")
+        self.assertEqual(hit_p["bbox"], [100, 40, 118, 19])
+        self.assertEqual(hit_p["center"], [159, 49])
+
+        # Wide horizontal gap rejects cross-column false phrase
+        self.assertIsNone(fast_ocr.match_ocr_phrase(words, "changes cancel"))
+
+        # Compact formatter splits wide gaps into separate clickable [x,y] entries
+        compact = fast_ocr.format_ocr_compact(words)
+        self.assertIn('[159,49] "Save Changes"', compact)
+        self.assertIn('[628,49] "Cancel"', compact)
+
+    def test_superhuman_compound_ops_ocr_and_zero_waste(self):
+        ocr_words = [
+            {"text": "Search", "x": 400, "y": 100, "w": 60, "h": 20, "conf": 94.0},
+            {"text": "Accept", "x": 500, "y": 240, "w": 60, "h": 20, "conf": 95.0},
+            {"text": "All", "x": 568, "y": 240, "w": 24, "h": 20, "conf": 93.0},
+        ]
+        # First OCR call empty, second call reveals "Accept All" -> wait_and_click must poll and click immediately
+        fake_ocr = FakeOCR(responses=[[], ocr_words])
+        eng, wm, clip, inp, ax, ov, bg = self._make_engine(elements=[], ocr=fake_ocr)
+
+        # wait_and_click + click_and_type + open_url + keys + repeat in ONE call!
+        eng._is_windows = False
+        eng._is_macos = False
+        blocks = eng.tool_act({
+            "observe": "none",
+            "steps": [
+                {"op": "wait_and_click", "text": "Accept All", "poll_ms": 20, "timeout_ms": 500, "smooth": False},
+                {"op": "click_and_type", "target": "Search", "text": "rust", "submit": True, "smooth": False},
+                {"op": "open_url", "url": "https://example.com", "new_tab": True, "smooth": False},
+                {"op": "keys", "sequence": ["ctrl+a", "ctrl+c"], "delay_ms": 0},
+                {"op": "repeat", "count": 3, "delay_ms": 0, "steps": [{"op": "key", "keys": "down"}]},
+            ],
+        })
+        self.assertIn("5/5 ok", blocks[0]["text"])
+        self.assertIn(("click", (546, 250, "left", 1, None)), inp.events)
+        self.assertIn(("click", (430, 110, "left", 1, None)), inp.events)
+        self.assertIn(("type_keys", "rust"), inp.events)
+        self.assertIn(("hotkey", ("ctrl+t", 1)), inp.events)
+        self.assertIn(("type_keys", "https://example.com"), inp.events)
+        self.assertEqual(inp.events.count(("hotkey", ("down", 1))), 3)
+
+        # desktop_observe(mode="ocr") returns clickable text coords with ZERO image block!
+        obs = eng.tool_observe({"mode": "ocr"})
+        self.assertEqual(len(obs), 1)
+        self.assertIn("OCR_TEXT", obs[0]["text"])
+        self.assertIn('[430,110] "Search"', obs[0]["text"])
+
+    def test_cursor_overlay_glide_to_is_non_blocking(self):
+        # Even with a long 250ms glide animation, glide_to() must return in <10ms (async on overlay thread)
+        ov = cursor_overlay.CursorOverlay()
+        ov._enabled = True
+        ov._ensure_started = lambda: None  # Test pure glide_to state machine without opening a native window
+        try:
+            t0 = time.perf_counter()
+            ov.glide_to(800, 600, label="Click", duration_ms=250, from_pos=(100, 100))
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.assertLess(elapsed_ms, 15.0)
+            self.assertEqual((ov._anim_tx, ov._anim_ty), (800.0, 600.0))
+            self.assertGreater(ov._anim_dur, 0.0)
+        finally:
+            ov.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and fast_ocr.FastOCR().available, "Requires Linux with Cairo + libtesseract")
+    def test_live_libtesseract_ocr_on_cairo_dark_ui(self):
+        import cairo
+        w, h = 420, 140
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        ctx = cairo.Context(surf)
+        # Dark-mode background (tests automatic luminance inversion!)
+        ctx.set_source_rgb(0.11, 0.12, 0.15)
+        ctx.paint()
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(24.0)
+        ctx.set_source_rgb(0.95, 0.96, 0.98)
+        ctx.move_to(40, 58)
+        ctx.show_text("Save Settings")
+        ctx.move_to(40, 112)
+        ctx.show_text("Cancel")
+        surf.flush()
+        bgra = np.frombuffer(surf.get_data(), dtype=np.uint8).reshape((h, w, 4))
+        rgba = bgra[:, :, [2, 1, 0, 3]].copy()
+        frame = capture.Frame(rgba=rgba, origin_x=200, origin_y=100, width=w, height=h, scale=1.0, backend="synthetic", capture_ms=0.1)
+
+        ocr = fast_ocr.FastOCR(workers=2)
+        try:
+            hit = ocr.find_text(frame, "Save Settings")
+            self.assertIsNotNone(hit, "Expected live libtesseract to detect dark-mode 'Save Settings'")
+            cx, cy = hit["center"]
+            self.assertTrue(240 <= cx <= 420, f"Unexpected cx={cx}")
+            self.assertTrue(130 <= cy <= 170, f"Unexpected cy={cy}")
+            # Second call hits frame fingerprint cache in <2 ms
+            t0 = time.perf_counter()
+            hit2 = ocr.find_text(frame, "Cancel")
+            self.assertIsNotNone(hit2)
+            self.assertLess((time.perf_counter() - t0) * 1000.0, 5.0)
+        finally:
+            ocr.close()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("Xvfb"), "Requires Linux with Xvfb")

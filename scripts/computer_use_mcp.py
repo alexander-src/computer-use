@@ -38,9 +38,10 @@ if _SCRIPT_DIR not in sys.path:
 
 from capture import Frame
 from cursor_overlay import CursorOverlay
+from fast_ocr import FastOCR, format_ocr_compact
 
 SERVER_NAME = "computer-use"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 _LINUX_SHIFT_V_TERMINALS = (
@@ -50,11 +51,13 @@ _LINUX_SHIFT_V_TERMINALS = (
 _WIN_SHIFT_V_TERMINALS = ("windowsterminal", "wezterm", "alacritty", "kitty", "mintty")
 
 SERVER_INSTRUCTIONS = (
-    "Fast Linux, Windows, and macOS Computer Use MCP server. Use desktop_observe (AX/UIA-first with "
-    "automatic visual fallback) to discover windows and [ref] IDs, then chain multi-step actions in "
-    "desktop_act. Moving the user's mouse does not abort by default (the AI glides its own custom cursor "
-    "overlay and restores the user's cursor). Use desktop_background and background=true for zero-touch "
-    "background automation on Linux (Xvfb), Windows (PrintWindow/PostMessage), or macOS (CGWindowList/PostPid+AX)."
+    "Superhuman-speed Linux, Windows, and macOS Computer Use MCP server. Act first without wasted "
+    "screenshots: chain multi-step workflows in ONE desktop_act call using compound ops (open_url, "
+    "wait_and_click, click_and_type, click(text=...), keys, repeat, focus, launch) with observe='none' "
+    "on predictable bursts. Text targets resolve locally via AX/UIA/AXUIElement + 8-thread parallel OCR "
+    "with zero extra LLM round-trips, and the cyan AI cursor glides non-blocking at 120Hz while "
+    "preserving your physical mouse. Use desktop_observe(mode='ocr') for zero-image text coords or "
+    "desktop_background + background=true for off-screen automation."
 )
 
 
@@ -126,6 +129,7 @@ class DesktopEngine:
         input_driver=None,
         overlay: CursorOverlay | None = None,
         background=None,
+        ocr: FastOCR | None = None,
     ):
         self._is_windows = sys.platform == "win32"
         self._is_macos = sys.platform == "darwin"
@@ -180,6 +184,7 @@ class DesktopEngine:
             self.background = background or LinuxBackgroundSession()
 
         self.overlay = overlay if overlay is not None else CursorOverlay()
+        self.ocr = ocr if ocr is not None else FastOCR()
         self.last_image_rect: tuple[int, int, int, int] | None = None
         self.last_bg_image_rect: tuple[int, int, int, int] | None = None
         self._ai_cursor_pos: tuple[float, float] | None = None
@@ -194,6 +199,7 @@ class DesktopEngine:
     def shutdown(self) -> None:
         for fn in (
             self.overlay.close,
+            self.ocr.close,
             self.input.close,
             getattr(self.a11y, "close", None),
             (self.background.stop if (self.background and self.background.active) else None),
@@ -234,7 +240,7 @@ class DesktopEngine:
         duration_ms: int | None = None,
         move_os_cursor: bool = False,
     ) -> None:
-        """Smoothly glide the custom cyan AI cursor along a natural cubic ease-in-out curve to (tx, ty)."""
+        """Glide the custom cyan AI cursor to (tx, ty); 0 ms non-blocking on overlay thread when independent."""
         use_smooth = self._smooth_default if smooth is None else bool(smooth)
         start = self._ai_cursor_pos
         if start is None:
@@ -252,7 +258,13 @@ class DesktopEngine:
                 self.input.move(tx, ty)
             return
 
-        dur_ms = int(duration_ms) if duration_ms is not None else int(max(20.0, min(55.0, 16.0 + dist * 0.032)))
+        dur_ms = int(duration_ms) if duration_ms is not None else int(max(24.0, min(65.0, 20.0 + dist * 0.035)))
+        # Non-blocking 120Hz glide on the overlay thread: zero sleep on the action critical path!
+        if not move_os_cursor and hasattr(self.overlay, "glide_to"):
+            self.overlay.glide_to(tx, ty, label=label, duration_ms=dur_ms, from_pos=(sx, sy))
+            self._ai_cursor_pos = (float(tx), float(ty))
+            return
+
         steps = max(4, min(10, dur_ms // 6))
         dt = (dur_ms / 1000.0) / steps
         arc = min(10.0, dist * 0.028)
@@ -334,6 +346,90 @@ class DesktopEngine:
             return (int(active_win["x"]), int(active_win["y"]), int(active_win["w"]), int(active_win["h"]))
         return self._virtual_bounds()
 
+    def _find_text_point(
+        self,
+        query: str,
+        active_win: dict[str, Any] | None = None,
+        *,
+        area: tuple[int, int, int, int] | None = None,
+        allow_ocr: bool = True,
+        background: bool = False,
+    ) -> tuple[int, int, str] | None:
+        """Resolve visible text to (x, y, source) locally: AX cache -> fresh AX -> parallel local OCR."""
+        if not background:
+            el = self.a11y.find_by_text(query)
+            if el is not None:
+                cx, cy = el["center"]
+                return int(cx), int(cy), "ax-cache"
+            if active_win is not None and self.a11y.available:
+                self._a11y_snapshot(active_win, diff=False)
+                el = self.a11y.find_by_text(query)
+                if el is not None:
+                    cx, cy = el["center"]
+                    return int(cx), int(cy), "ax"
+
+        if allow_ocr and self.ocr.available:
+            try:
+                if background:
+                    frame = self.background.capture(area=area)
+                    hit = self.ocr.find_text(frame, query)
+                    if hit is not None:
+                        return int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})"
+                    return None
+                if self.capture.backend == "unavailable":
+                    return None
+                if area is not None:
+                    frame = self.capture.capture(scope="area", area=area, include_cursor=False)
+                    hit = self.ocr.find_text(frame, query)
+                    if hit is not None:
+                        return int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})"
+                    return None
+                # Search active window crop first (~3x faster than full screen), then fall back to full screen
+                vx, vy, vw, vh = self._virtual_bounds()
+                tried_full = False
+                if (
+                    active_win is not None
+                    and int(active_win.get("w", 0)) >= 120
+                    and int(active_win.get("h", 0)) >= 100
+                ):
+                    aw_rect = (
+                        int(active_win["x"]), int(active_win["y"]),
+                        int(active_win["w"]), int(active_win["h"]),
+                    )
+                    if aw_rect[2] < vw * 0.92 or aw_rect[3] < vh * 0.92:
+                        frame = self.capture.capture(scope="area", area=aw_rect, include_cursor=False)
+                        hit = self.ocr.find_text(frame, query)
+                        if hit is not None:
+                            return int(hit["center"][0]), int(hit["center"][1]), f"ocr-win({hit['match_type']})"
+                    else:
+                        tried_full = False
+                if not tried_full:
+                    frame = self.capture.capture(scope="screen", include_cursor=False)
+                    hit = self.ocr.find_text(frame, query)
+                    if hit is not None:
+                        return int(hit["center"][0]), int(hit["center"][1]), f"ocr({hit['match_type']})"
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _steps_need_active_win(steps: list[Any]) -> bool:
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            op = str(st.get("op") or st.get("action") or "").lower()
+            if str(st.get("coord_scope") or "").lower() == "active":
+                return True
+            if op in ("type", "click_and_type", "wait_and_click", "screenshot"):
+                return True
+            if op == "wait" and st.get("text"):
+                return True
+            if st.get("text_target") or st.get("target") or (op != "type" and st.get("text")):
+                return True
+            if op == "repeat" and DesktopEngine._steps_need_active_win(st.get("steps") or []):
+                return True
+        return False
+
     def resolve_point(
         self,
         step: dict[str, Any],
@@ -365,23 +461,22 @@ class DesktopEngine:
             px, py = normalized_to_screen(float(step[nx_k]), float(step[ny_k]), rect)
             return (px, py) if background else self._clamp_screen(px, py)
 
-        if step.get(text_k) and step.get("op") != "type":
+        raw_area = step.get("area")
+        step_area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+        allow_ocr = bool(step.get("ocr", True))
+
+        if step.get(text_k) and step.get("op") not in ("type", "click_and_type"):
             q = str(step[text_k])
-            el = self.a11y.find_by_text(q)
-            if el is None and active_win is not None:
-                self._a11y_snapshot(active_win, diff=False)
-                el = self.a11y.find_by_text(q)
-            if el is None:
-                raise ValueError(f"No accessibility element matched text {q!r}. Use desktop_observe or coordinates.")
-            cx, cy = el["center"]
-            return int(cx), int(cy)
+            found = self._find_text_point(q, active_win, area=step_area, allow_ocr=allow_ocr, background=background)
+            if found is None:
+                raise ValueError(f"No AX or OCR element matched text {q!r}. Use desktop_observe or coordinates.")
+            return found[0], found[1]
         if step.get("text_target"):
             q = str(step["text_target"])
-            el = self.a11y.find_by_text(q)
-            if el is None:
-                raise ValueError(f"No accessibility element matched text_target {q!r}.")
-            cx, cy = el["center"]
-            return int(cx), int(cy)
+            found = self._find_text_point(q, active_win, area=step_area, allow_ocr=allow_ocr, background=background)
+            if found is None:
+                raise ValueError(f"No AX or OCR element matched text_target {q!r}.")
+            return found[0], found[1]
 
         if required:
             raise ValueError(f"Missing target: provide {ref_k}, {x_k}/{y_k}, {nx_k}/{ny_k}, or text")
@@ -549,6 +644,7 @@ class DesktopEngine:
                 "windows": self.windows.backend,
                 "clipboard": self.clipboard.backend,
                 "a11y": a11y_label if self.a11y.available else "unavailable",
+                "ocr": "libtesseract-parallel" if self.ocr.available else "unavailable",
                 "cursor_overlay": self.overlay.backend,
                 "background": self.background.status(),
             },
@@ -767,8 +863,8 @@ class DesktopEngine:
             return self.tool_screenshot({
                 "background": True,
                 "grid": bool(args.get("grid", True)),
-                "max_width": int(args.get("max_width", 1280)),
-                "quality": int(args.get("quality", 75)),
+                "max_width": int(args.get("max_width", 896)),
+                "quality": int(args.get("quality", 62)),
             })
 
         t0 = time.perf_counter()
@@ -778,8 +874,9 @@ class DesktopEngine:
         ss_opt = args.get("screenshot", "auto")
         scope = (args.get("scope") or "screen").lower()
         max_elements = int(args.get("max_elements", 100))
-        max_width = int(args.get("max_width", 1024))
-        quality = int(args.get("quality", 68))
+        max_width = int(args.get("max_width", 896))
+        quality = int(args.get("quality", 62))
+        want_ocr = bool(args.get("ocr", False)) or (mode == "ocr")
 
         st = self.windows.state()
         win_ms = (time.perf_counter() - t0) * 1000.0
@@ -819,9 +916,23 @@ class DesktopEngine:
             want_ss = (mode == "vision") or (mode == "hybrid" and n_ax < 5)
 
         content: list[dict[str, Any]] = []
-        if want_ss:
+        frame: Frame | None = None
+        if want_ss or want_ocr:
             active_rect = (int(active["x"]), int(active["y"]), int(active["w"]), int(active["h"])) if (scope == "active" and active) else None
-            frame = self.capture.capture(scope=scope, active_rect=active_rect, include_cursor=True)
+            if self.capture.backend != "unavailable":
+                frame = self.capture.capture(scope=scope, active_rect=active_rect, include_cursor=want_ss)
+
+        if want_ocr and frame is not None:
+            t_ocr = time.perf_counter()
+            words = self.ocr.scan_frame(frame)
+            if find_q:
+                fq = str(find_q).lower()
+                words = [w for w in words if fq in w["text"].lower()]
+            ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
+            lines.append(f"OCR_TEXT ({len(words)} words, {ocr_ms:.1f}ms):")
+            lines.append(format_ocr_compact(words))
+
+        if want_ss and frame is not None:
             diff_px = self.capture.diff_from_last(frame, ignore_rects=self._overlay_ignore_rects())
             annotate = bool(args["annotate"]) if "annotate" in args else (n_ax > 0)
             grid = bool(args["grid"]) if "grid" in args else (n_ax < 5)
@@ -861,7 +972,7 @@ class DesktopEngine:
         if "verify_change" in args:
             verify_change = bool(args["verify_change"])
         else:
-            verify_change = False if (fast or observe_opt == "none") else True
+            verify_change = (observe_opt == "crop_changed")
         detect_takeover = bool(args.get("detect_takeover", False))
         # If caller explicitly opted into detect_takeover=True without setting independent_cursor, honor takeover mode
         if "independent_cursor" in args:
@@ -869,11 +980,17 @@ class DesktopEngine:
         else:
             independent_cursor = False if detect_takeover else self._independent_cursor_default
         smooth = False if fast else args.get("smooth", self._smooth_default)
-        settle_opt = args.get("settle", "none" if (fast or (observe_opt == "none" and not verify_change)) else "smart")
-        max_width = int(args.get("max_width", 1024))
-        quality = int(args.get("quality", 68))
+        if "settle" in args:
+            settle_opt: Any = args["settle"]
+        elif fast or (observe_opt == "none" and not verify_change):
+            settle_opt = "none"
+        else:
+            settle_opt = "fast_flip"
+        max_width = int(args.get("max_width", 896))
+        quality = int(args.get("quality", 62))
 
-        st_before = self.windows.state() if not bg else {"active": None, "cursor": {"x": 0, "y": 0}}
+        need_pre_state = (not bg) and self._steps_need_active_win(raw_steps)
+        st_before = self.windows.state() if need_pre_state else {"active": None, "cursor": {"x": 0, "y": 0}}
         active_win = st_before.get("active")
         before_frame: Frame | None = None
         before_ig: list[tuple[int, int, int, int]] = []
@@ -890,6 +1007,7 @@ class DesktopEngine:
         step_results: list[dict[str, Any]] = []
         extra_images: list[dict[str, Any]] = []
         aborted_takeover = False
+        had_mutation = False
 
         for idx, raw_step in enumerate(raw_steps):
             if not isinstance(raw_step, dict):
@@ -909,6 +1027,8 @@ class DesktopEngine:
                     break
 
             op = (raw_step.get("op") or raw_step.get("action") or "").lower()
+            if op not in ("wait", "screenshot"):
+                had_mutation = True
             try:
                 if bg:
                     res, imgs = self._exec_bg_step(op, raw_step)
@@ -931,21 +1051,26 @@ class DesktopEngine:
                 if isinstance(settle_opt, (int, float)) and settle_opt > 0:
                     time.sleep(min(5.0, float(settle_opt) / 1000.0))
                 elif settle_opt == "smart":
-                    time.sleep(0.035)
-                try:
-                    after_frame = self.background.capture()
-                except Exception:
-                    after_frame = None
+                    time.sleep(0.030)
+                elif settle_opt == "fast_flip" and had_mutation:
+                    time.sleep(0.020)
+                if observe_opt != "none" or before_frame is not None:
+                    try:
+                        after_frame = self.background.capture()
+                    except Exception:
+                        after_frame = None
             else:
                 if settle_opt == "smart" and self.capture.backend != "unavailable":
                     try:
-                        # Match include_cursor=False with before_frame and ignore our own AI cursor/ripple rects!
                         after_frame = self.capture.wait_until_settled(
                             scope="screen", max_wait_ms=55, poll_ms=16,
                             include_cursor=False, ignore_rects_fn=self._overlay_ignore_rects,
                         )
                     except Exception:
                         after_frame = None
+                elif settle_opt == "fast_flip" and had_mutation and self.capture.backend != "unavailable":
+                    # Single 60Hz compositor frame beat (~14 ms) instead of multi-frame settle polling
+                    time.sleep(0.014)
                 elif isinstance(settle_opt, (int, float)) and settle_opt > 0:
                     time.sleep(min(5.0, float(settle_opt) / 1000.0))
 
@@ -1048,7 +1173,7 @@ class DesktopEngine:
             out_blocks.extend(extra_images)
         return out_blocks
 
-    def _exec_bg_step(self, op: str, step: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def _exec_bg_step(self, op: str, step: dict[str, Any], *, _depth: int = 0) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         extra_images: list[dict[str, Any]] = []
         if op == "click":
             pt = self.resolve_point(step, required=True, background=True)
@@ -1057,6 +1182,50 @@ class DesktopEngine:
             count = 2 if step.get("double") else int(step.get("count", 1))
             pos = self.background.click(pt[0], pt[1], button=button, count=count)
             return {"pos": list(pos), "button": button, "count": count}, extra_images
+        if op == "click_and_type":
+            t_step = dict(step)
+            t_step["op"] = "type"
+            if "target" in t_step and "text_target" not in t_step:
+                t_step["text_target"] = t_step.pop("target")
+            if "value" in t_step and "text" not in t_step:
+                t_step["text"] = t_step.pop("value")
+            return self._exec_bg_step("type", t_step, _depth=_depth)
+        if op == "wait_and_click":
+            q = str(step.get("text") or step.get("target") or "").strip()
+            if not q:
+                raise ValueError("wait_and_click requires 'text'")
+            timeout_ms = max(50, min(15000, int(step.get("timeout_ms", 2500))))
+            poll_s = max(0.02, min(0.5, float(step.get("poll_ms", 50)) / 1000.0))
+            raw_area = step.get("area")
+            area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+            t_start = time.monotonic()
+            deadline = t_start + timeout_ms / 1000.0
+            found: tuple[int, int, str] | None = None
+            while True:
+                found = self._find_text_point(q, area=area, allow_ocr=True, background=True)
+                if found is not None or time.monotonic() >= deadline:
+                    break
+                time.sleep(poll_s)
+            if found is None:
+                raise TimeoutError(f"wait_and_click timed out after {timeout_ms}ms waiting for {q!r}")
+            px, py, src = found
+            button = str(step.get("button", "left"))
+            count = 2 if step.get("double") else int(step.get("count", 1))
+            self.background.click(px, py, button=button, count=count)
+            out: dict[str, Any] = {
+                "pos": [px, py], "source": src, "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
+            }
+            type_val = step.get("type_text") if "type_text" in step else step.get("value")
+            if type_val is not None:
+                time.sleep(0.02)
+                if step.get("clear"):
+                    self.background.hotkey("cmd+a" if self._is_macos else "ctrl+a")
+                    self.background.hotkey("backspace")
+                self.background.type_text(str(type_val))
+                if step.get("submit"):
+                    self.background.hotkey("enter")
+                out["typed"] = len(str(type_val))
+            return out, extra_images
         if op in ("move", "hover"):
             pt = self.resolve_point(step, required=True, background=True)
             assert pt is not None
@@ -1101,6 +1270,32 @@ class DesktopEngine:
             count = int(step.get("count", 1))
             self.background.hotkey(keys, count=count)
             return {"keys": keys, "count": count}, extra_images
+        if op == "keys":
+            seq = step.get("sequence") or step.get("keys")
+            if not isinstance(seq, list) or not seq:
+                raise ValueError("op='keys' requires a non-empty 'sequence' list")
+            delay_s = max(0.0, min(0.5, float(step.get("delay_ms", 10)) / 1000.0))
+            for i, combo in enumerate(seq):
+                self.background.hotkey(combo)
+                if delay_s > 0 and i < len(seq) - 1:
+                    time.sleep(delay_s)
+            return {"sequence": len(seq)}, extra_images
+        if op == "repeat":
+            if _depth >= 2:
+                raise ValueError("repeat nesting limit exceeded")
+            inner = step.get("steps")
+            if not isinstance(inner, list) or not inner:
+                raise ValueError("op='repeat' requires non-empty 'steps'")
+            count = max(1, min(200, int(step.get("count", 1))))
+            delay_s = max(0.0, min(1.0, float(step.get("delay_ms", 8)) / 1000.0))
+            for r_i in range(count):
+                for sub in inner:
+                    sub_op = str(sub.get("op") or sub.get("action") or "").lower()
+                    _, sub_imgs = self._exec_bg_step(sub_op, sub, _depth=_depth + 1)
+                    extra_images.extend(sub_imgs)
+                if delay_s > 0 and r_i < count - 1:
+                    time.sleep(delay_s)
+            return {"repeated": count, "steps_each": len(inner)}, extra_images
         if op == "launch":
             cmd = step.get("command")
             if not cmd:
@@ -1133,9 +1328,145 @@ class DesktopEngine:
         *,
         smooth: bool = True,
         independent_cursor: bool = True,
+        _depth: int = 0,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
         extra_images: list[dict[str, Any]] = []
         ffm = self._is_ffm_compositor()
+
+        if op == "click_and_type":
+            t_step = dict(step)
+            t_step["op"] = "type"
+            if "target" in t_step and "text_target" not in t_step:
+                t_step["text_target"] = t_step.pop("target")
+            if "value" in t_step and "text" not in t_step:
+                t_step["text"] = t_step.pop("value")
+            return self._exec_step(
+                "type", t_step, active_win, smooth=smooth, independent_cursor=independent_cursor, _depth=_depth,
+            )
+
+        if op == "wait_and_click":
+            q = str(step.get("text") or step.get("target") or "").strip()
+            if not q:
+                raise ValueError("wait_and_click requires 'text'")
+            timeout_ms = max(50, min(15000, int(step.get("timeout_ms", 2500))))
+            poll_s = max(0.02, min(0.5, float(step.get("poll_ms", 45)) / 1000.0))
+            raw_area = step.get("area")
+            area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+            t_start = time.monotonic()
+            deadline = t_start + timeout_ms / 1000.0
+            found: tuple[int, int, str] | None = None
+            while True:
+                found = self._find_text_point(q, active_win, area=area, allow_ocr=bool(step.get("ocr", True)))
+                if found is not None or time.monotonic() >= deadline:
+                    break
+                time.sleep(poll_s)
+            if found is None:
+                raise TimeoutError(f"wait_and_click timed out after {timeout_ms}ms waiting for {q!r}")
+            px, py, src = found
+            click_step = {
+                k: v for k, v in step.items()
+                if k not in ("text", "target", "text_target", "type_text", "value", "clear", "submit")
+            }
+            click_step.update({"op": "click", "x": px, "y": py})
+            click_res, c_imgs, active_win = self._exec_step(
+                "click", click_step, active_win, smooth=smooth, independent_cursor=independent_cursor, _depth=_depth,
+            )
+            extra_images.extend(c_imgs)
+            out: dict[str, Any] = {
+                **click_res,
+                "source": src,
+                "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
+            }
+            type_val = step.get("type_text") if "type_text" in step else step.get("value")
+            if type_val is not None:
+                time.sleep(0.015)
+                t_res, t_imgs, active_win = self._exec_step(
+                    "type",
+                    {
+                        "op": "type",
+                        "text": str(type_val),
+                        "clear": bool(step.get("clear", False)),
+                        "submit": bool(step.get("submit", False)),
+                        "mode": step.get("mode", "auto"),
+                    },
+                    active_win,
+                    smooth=smooth,
+                    independent_cursor=independent_cursor,
+                    _depth=_depth,
+                )
+                extra_images.extend(t_imgs)
+                out["typed"] = t_res
+            return out, extra_images, active_win
+
+        if op == "open_url":
+            url = str(step.get("url") or "").strip()
+            if not url:
+                raise ValueError("open_url requires 'url'")
+            app_name = step.get("app")
+            if app_name:
+                try:
+                    self.windows.control("focus", app=str(app_name))
+                    time.sleep(0.03)
+                except Exception:
+                    self.windows.launch(str(app_name), wait_app=str(app_name), timeout_ms=int(step.get("timeout_ms", 4000)))
+                    time.sleep(0.08)
+                active_win = self.windows.state().get("active")
+            mod = "cmd" if self._is_macos else "ctrl"
+            if step.get("new_tab"):
+                self.input.hotkey(f"{mod}+t")
+                time.sleep(0.035)
+            else:
+                self.input.hotkey(f"{mod}+l")
+                time.sleep(0.022)
+            t_res, t_imgs, active_win = self._exec_step(
+                "type",
+                {
+                    "op": "type",
+                    "text": url,
+                    "submit": bool(step.get("submit", True)),
+                    "mode": step.get("mode", "auto"),
+                },
+                active_win,
+                smooth=smooth,
+                independent_cursor=independent_cursor,
+                _depth=_depth,
+            )
+            extra_images.extend(t_imgs)
+            return {"url": url, "app": app_name, "new_tab": bool(step.get("new_tab")), **t_res}, extra_images, active_win
+
+        if op == "keys":
+            self._cancel_clip_restore()
+            seq = step.get("sequence") or step.get("keys")
+            if not isinstance(seq, list) or not seq:
+                raise ValueError("op='keys' requires a non-empty 'sequence' list")
+            delay_s = max(0.0, min(0.5, float(step.get("delay_ms", 10)) / 1000.0))
+            for i, combo in enumerate(seq):
+                self.input.hotkey(combo)
+                if delay_s > 0 and i < len(seq) - 1:
+                    time.sleep(delay_s)
+            return {"sequence": len(seq)}, extra_images, active_win
+
+        if op == "repeat":
+            if _depth >= 2:
+                raise ValueError("repeat nesting limit exceeded")
+            inner = step.get("steps")
+            if not isinstance(inner, list) or not inner:
+                raise ValueError("op='repeat' requires non-empty 'steps'")
+            count = max(1, min(200, int(step.get("count", 1))))
+            delay_s = max(0.0, min(1.0, float(step.get("delay_ms", 8)) / 1000.0))
+            for r_i in range(count):
+                for sub in inner:
+                    sub_op = str(sub.get("op") or sub.get("action") or "").lower()
+                    _, sub_imgs, active_win = self._exec_step(
+                        sub_op, sub, active_win,
+                        smooth=bool(sub.get("smooth", smooth)),
+                        independent_cursor=bool(sub.get("independent_cursor", independent_cursor)),
+                        _depth=_depth + 1,
+                    )
+                    extra_images.extend(sub_imgs)
+                if delay_s > 0 and r_i < count - 1:
+                    time.sleep(delay_s)
+            return {"repeated": count, "steps_each": len(inner)}, extra_images, active_win
 
         if op == "click":
             pt = self.resolve_point(step, active_win=active_win, required=False)
@@ -1334,14 +1665,21 @@ class DesktopEngine:
                 return {"found": False, "app": q}, extra_images, active_win
             if step.get("text"):
                 q = str(step["text"])
-                deadline = time.monotonic() + timeout_ms / 1000.0
+                raw_area = step.get("area")
+                area = tuple(int(v) for v in raw_area) if (isinstance(raw_area, (list, tuple)) and len(raw_area) == 4) else None
+                t_start = time.monotonic()
+                deadline = t_start + timeout_ms / 1000.0
                 while time.monotonic() < deadline:
-                    st = self.windows.state()
-                    aw = st.get("active")
-                    snap = self._a11y_snapshot(aw, find=q, diff=False)
-                    if snap["elements"] or snap["text_lines"]:
-                        return {"found": True, "matches": len(snap["elements"]) + len(snap["text_lines"])}, extra_images, aw
-                    time.sleep(0.08)
+                    aw = self.windows.state().get("active")
+                    hit = self._find_text_point(q, aw, area=area, allow_ocr=bool(step.get("ocr", True)))
+                    if hit is not None:
+                        return {
+                            "found": True,
+                            "pos": [hit[0], hit[1]],
+                            "source": hit[2],
+                            "waited_ms": round((time.monotonic() - t_start) * 1000.0, 1),
+                        }, extra_images, aw
+                    time.sleep(0.05)
                 return {"found": False, "text": q}, extra_images, active_win
             ms = max(0, min(10000, int(step.get("ms", 150))))
             time.sleep(ms / 1000.0)
@@ -1366,38 +1704,44 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Observe the Linux, Windows, or macOS desktop in 1 call: window list + active window + cursor (~1.2 ms) "
             "+ semantic accessibility [ref] tree (AT-SPI2 / UIA / AXUIElement with incremental AX_DIFF) "
-            "+ automatic ~5 ms JPEG screenshot with Set-of-Marks/grid when AX has <5 elements. Pass background=true for background session."
+            "+ optional parallel local OCR (mode='ocr' or ocr=true for clickable [x,y] text with zero image tokens) "
+            "+ automatic ~5 ms compact JPEG screenshot (896px) with Set-of-Marks/grid when AX has <5 elements."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["hybrid", "ax", "vision", "windows"], "default": "hybrid"},
+                "mode": {"type": "string", "enum": ["hybrid", "ax", "ocr", "vision", "windows"], "default": "hybrid"},
                 "background": {"type": "boolean", "default": False},
-                "find": {"type": "string", "description": "Filter AX elements and text by substring."},
+                "ocr": {"type": "boolean", "default": False, "description": "Run local parallel OCR and return clickable [x,y] text lines."},
+                "find": {"type": "string", "description": "Filter AX/OCR elements and text by substring."},
                 "diff": {"oneOf": [{"type": "string", "enum": ["auto"]}, {"type": "boolean"}], "default": "auto"},
                 "screenshot": {"oneOf": [{"type": "string", "enum": ["auto"]}, {"type": "boolean"}], "default": "auto"},
                 "scope": {"type": "string", "enum": ["screen", "active"], "default": "screen"},
                 "annotate": {"type": "boolean", "description": "Draw Set-of-Marks [ref] badges on screenshot."},
                 "grid": {"type": "boolean", "description": "Draw 0..1000 normalized coordinate grid on screenshot."},
                 "max_elements": {"type": "integer", "default": 100},
-                "max_width": {"type": "integer", "default": 1024},
-                "quality": {"type": "integer", "default": 68},
+                "max_width": {"type": "integer", "default": 896},
+                "quality": {"type": "integer", "default": 62},
             },
         },
     },
     {
         "name": "desktop_act",
         "description": (
-            "Execute batched desktop actions at human speed with an independent smooth-gliding cyan AI cursor + animated click "
-            "ripples (preserving your physical mouse; moving your mouse does not abort). Chain focus+click+type+key in ONE call "
-            "and pass fast=true or observe='none' for instant multi-step bursts. Supports background=true on Linux, Windows, & macOS."
+            "Execute batched desktop actions at superhuman speed with a 0 ms non-blocking 120Hz cyan AI cursor + "
+            "click ripples (preserving your physical mouse). Chain entire workflows in ONE call using compound ops "
+            "(open_url, wait_and_click, click_and_type, click(text=...), keys, repeat, focus, launch) with local "
+            "AX + 8-thread parallel OCR text targeting and observe='none' on predictable bursts."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "steps": {
                     "type": "array",
-                    "description": "Ordered steps. Ops: click, move/hover, drag, scroll, type, key/hotkey, ax_action, focus, window, launch, wait, screenshot.",
+                    "description": (
+                        "Ordered steps. Ops: click, click_and_type, wait_and_click, open_url, keys, repeat, "
+                        "move/hover, drag, scroll, type, key/hotkey, ax_action, focus, window, launch, wait, screenshot."
+                    ),
                     "items": {"type": "object"},
                 },
                 "op": {"type": "string", "description": "Single-step shorthand op when 'steps' is omitted."},
@@ -1405,15 +1749,15 @@ TOOLS: list[dict[str, Any]] = [
                 "fast": {"type": "boolean", "default": False, "description": "Instant 0ms cursor snap and skip settle/diff for maximum speed."},
                 "smooth": {"type": "boolean", "default": True},
                 "independent_cursor": {"type": "boolean", "default": True},
-                "settle": {"oneOf": [{"type": "string", "enum": ["smart", "none"]}, {"type": "integer"}], "default": "smart"},
+                "settle": {"oneOf": [{"type": "string", "enum": ["smart", "none"]}, {"type": "integer"}], "default": "none"},
                 "observe": {"type": "string", "enum": ["auto", "ax", "vision", "crop_changed", "none"], "default": "auto"},
-                "verify_change": {"type": "boolean", "default": True},
+                "verify_change": {"type": "boolean", "default": False},
                 "detect_takeover": {"type": "boolean", "default": False},
                 "screenshot": {"type": "boolean"},
                 "annotate": {"type": "boolean"},
                 "grid": {"type": "boolean"},
-                "max_width": {"type": "integer", "default": 1280},
-                "quality": {"type": "integer", "default": 75},
+                "max_width": {"type": "integer", "default": 896},
+                "quality": {"type": "integer", "default": 62},
             },
         },
     },
@@ -1713,10 +2057,12 @@ def run_bench(server: MCPServer, runs: int = 5) -> int:
 
         bench(f"capture full screen [{eng.capture.backend}]", cap_full)
         bench("capture 400x300 area", lambda: (lambda f: f"{f.width}x{f.height}")(eng.capture.capture(scope='area', area=(vx, vy, min(400, vw), min(300, vh)))))
-        bench("encode 1024w JPEG q=68", lambda: f"{eng.capture.encode(f_full[0], max_width=1024, quality=68)['bytes']//1024} KB")
-        bench("encode 1024w JPEG + grid + cursor", lambda: f"{eng.capture.encode(f_full[0], max_width=1024, quality=68, grid=True, cursor=(vx + 400, vy + 300))['bytes']//1024} KB")
+        bench("encode 896w JPEG q=62", lambda: f"{eng.capture.encode(f_full[0], max_width=896, quality=62)['bytes']//1024} KB")
+        bench("encode 896w JPEG + grid + cursor", lambda: f"{eng.capture.encode(f_full[0], max_width=896, quality=62, grid=True, cursor=(vx + 400, vy + 300))['bytes']//1024} KB")
         f2 = eng.capture.capture(scope="screen", include_cursor=True)
         bench("numpy diff_frames", lambda: f"changed={eng.capture.diff_frames(f_full[0], f2)['changed_pct']}%")
+        if eng.ocr.available:
+            bench("fast_ocr scan_frame (cached)", lambda: f"{len(eng.ocr.scan_frame(f_full[0]))} words")
     if eng.a11y.available:
         st = eng.windows.state()
         aw = st.get("active")
@@ -1739,8 +2085,9 @@ def run_demo_cursor(server: MCPServer) -> int:
     eng._ai_cursor_pos = (float(pts[0][0] - 120), float(pts[0][1] - 80))
     for i, (px, py) in enumerate(pts):
         eng._glide_ai_cursor(px, py, label="AI", smooth=True, duration_ms=160, move_os_cursor=False)
+        time.sleep(0.17)
         eng.overlay.show_click(px, py, button="right" if i == 1 else "left", double=(i == 2))
-        time.sleep(0.42)
+        time.sleep(0.32)
     time.sleep(0.35)
     print(f"Overlay backend: {eng.overlay.backend}")
     return 0
